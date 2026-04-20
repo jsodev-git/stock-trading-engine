@@ -106,6 +106,14 @@ class BackendClient:
         resp = self._session.post(url, json=payload, timeout=10)
         resp.raise_for_status()
 
+    def update_position_prices(self, bot_id: int, prices: list[dict[str, Any]]) -> None:
+        """prices: [{"stockCode": "005930", "currentPrice": 73000}, ...]"""
+        if not prices:
+            return
+        url = f"{self.base_url}/api/internal/positions/prices"
+        resp = self._session.post(url, json={"botId": bot_id, "prices": prices}, timeout=10)
+        resp.raise_for_status()
+
     def record_signal(self, bot_id: int, signal: dict[str, Any]) -> None:
         """매매 시그널 저장."""
         payload = {

@@ -67,6 +67,16 @@ def sync_balances(client: BackendClient) -> None:
             )
         except Exception as e:
             log.warning("[sync_balances][%s] 스냅샷 전송 실패: %s", bot_name, e)
+
+        # 포지션 최신 시세 일괄 갱신 (Position.lastPrice + peakPrice)
+        try:
+            price_entries = [
+                {"stockCode": p.stock_code, "currentPrice": p.current_price}
+                for p in balance.positions if p.current_price > 0
+            ]
+            client.update_position_prices(bot_id, price_entries)
+        except Exception as e:
+            log.warning("[sync_balances][%s] 포지션 가격 갱신 실패: %s", bot_name, e)
         finally:
             try:
                 broker.disconnect()

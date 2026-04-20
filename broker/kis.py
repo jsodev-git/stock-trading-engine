@@ -64,6 +64,12 @@ class KISBroker(BaseBroker):
     # 프로세스 재시작 시 rate limit을 피하려면 파일에 영속화
     _TOKEN_STORE = Path(__file__).resolve().parents[1] / ".kis_tokens.json"
 
+    # KIS 일반 API는 초당 1회. 모든 HTTP 호출을 전역 락으로 직렬화하고
+    # 이전 호출 시각을 추적해 최소 1.1초 간격을 강제한다.
+    _API_LOCK = threading.Lock()
+    _LAST_API_CALL: float = 0.0
+    _MIN_API_INTERVAL = 1.1  # seconds
+
     def __init__(self, market: Market = Market.KR,
                  account_type: AccountType = AccountType.MOCK) -> None:
         self.market = market
@@ -146,7 +152,7 @@ class KISBroker(BaseBroker):
                 "appkey": self._app_key,
                 "appsecret": self._app_secret,
             }
-            resp = self._session.post(url, json=body, timeout=self.TIMEOUT)
+            resp = self._api_call("POST", url, json=body)
             if resp.status_code != 200:
                 raise RuntimeError(f"KIS 토큰 발급 실패: {resp.status_code} {resp.text}")
             data = resp.json()
@@ -202,6 +208,25 @@ class KISBroker(BaseBroker):
         if self._token is None or time.time() >= self._token.expires_at:
             self._fetch_token()
 
+    # ─── HTTP 직렬화 ───
+
+    def _api_call(self, method: str, url: str, **kwargs) -> requests.Response:
+        """모든 KIS HTTP 호출을 직렬화 + 최소 간격 보장.
+
+        클래스 락을 잡는 동안 이전 호출 시각을 확인해, 필요하면 sleep으로 보충한다.
+        여러 브로커 인스턴스·여러 스레드가 동시 호출해도 초당 1회 제한을 지킨다.
+        """
+        with self.__class__._API_LOCK:
+            elapsed = time.time() - self.__class__._LAST_API_CALL
+            wait = self._MIN_API_INTERVAL - elapsed
+            if wait > 0:
+                time.sleep(wait)
+            try:
+                kwargs.setdefault("timeout", self.TIMEOUT)
+                return self._session.request(method, url, **kwargs)
+            finally:
+                self.__class__._LAST_API_CALL = time.time()
+
     @staticmethod
     def _split_account(account_no: str) -> tuple[str, str]:
         raw = account_no.replace("-", "").strip()
@@ -229,8 +254,7 @@ class KISBroker(BaseBroker):
             "CTX_AREA_FK100": "",
             "CTX_AREA_NK100": "",
         }
-        resp = self._session.get(url, headers=self._auth_headers(tr_id),
-                                 params=params, timeout=self.TIMEOUT)
+        resp = self._api_call('GET', url, headers=self._auth_headers(tr_id), params=params)
         if resp.status_code != 200:
             raise RuntimeError(f"KIS 잔고 조회 실패: {resp.status_code} {resp.text}")
 
@@ -268,8 +292,7 @@ class KISBroker(BaseBroker):
         # 주식현재가 시세: 실/모의 공용 FHKST01010100
         url = f"{self.base_url}/uapi/domestic-stock/v1/quotations/inquire-price"
         params = {"FID_COND_MRKT_DIV_CODE": "J", "FID_INPUT_ISCD": stock_code}
-        resp = self._session.get(url, headers=self._auth_headers("FHKST01010100"),
-                                 params=params, timeout=self.TIMEOUT)
+        resp = self._api_call('GET', url, headers=self._auth_headers("FHKST01010100"), params=params)
         if resp.status_code != 200:
             raise RuntimeError(f"KIS 시세 조회 실패: {resp.status_code} {resp.text}")
         data = resp.json().get("output") or {}
@@ -296,8 +319,7 @@ class KISBroker(BaseBroker):
             "FID_VOL_CNT": "",
             "FID_INPUT_DATE_1": "",
         }
-        resp = self._session.get(url, headers=self._auth_headers("FHPST01710000"),
-                                 params=params, timeout=self.TIMEOUT)
+        resp = self._api_call('GET', url, headers=self._auth_headers("FHPST01710000"), params=params)
         if resp.status_code != 200:
             raise RuntimeError(f"KIS 거래량 상위 실패: {resp.status_code} {resp.text}")
 
@@ -337,8 +359,7 @@ class KISBroker(BaseBroker):
             "FID_RSFL_RATE1": "",
             "FID_RSFL_RATE2": "",
         }
-        resp = self._session.get(url, headers=self._auth_headers("FHPST01700000"),
-                                 params=params, timeout=self.TIMEOUT)
+        resp = self._api_call('GET', url, headers=self._auth_headers("FHPST01700000"), params=params)
         if resp.status_code != 200:
             raise RuntimeError(f"KIS 등락률 상위 실패: {resp.status_code} {resp.text}")
 
@@ -363,8 +384,7 @@ class KISBroker(BaseBroker):
         """
         url = f"{self.base_url}/uapi/domestic-stock/v1/quotations/inquire-investor"
         params = {"FID_COND_MRKT_DIV_CODE": "J", "FID_INPUT_ISCD": stock_code}
-        resp = self._session.get(url, headers=self._auth_headers("FHKST01010900"),
-                                 params=params, timeout=self.TIMEOUT)
+        resp = self._api_call('GET', url, headers=self._auth_headers("FHKST01010900"), params=params)
         if resp.status_code != 200:
             raise RuntimeError(f"KIS 수급 조회 실패: {resp.status_code} {resp.text}")
 
@@ -411,8 +431,7 @@ class KISBroker(BaseBroker):
             "ORD_QTY": str(quantity),
             "ORD_UNPR": ord_unpr,
         }
-        resp = self._session.post(url, headers=self._auth_headers(tr_id),
-                                  json=body, timeout=self.TIMEOUT)
+        resp = self._api_call('POST', url, headers=self._auth_headers(tr_id), json=body)
         if resp.status_code != 200:
             raise RuntimeError(f"KIS 주문 실패: {resp.status_code} {resp.text}")
 

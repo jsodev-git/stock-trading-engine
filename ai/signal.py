@@ -53,7 +53,26 @@ def score_buy_candidate(
     individual_net: int,
     ranker_size: int = 30,
 ) -> Signal:
-    """매수 후보 점수화 → Signal."""
+    """매수 후보 점수화 → Signal.
+
+    KRX 가격제한폭이 ±30%라 상한가/하한가 근접 종목은 매수 제외.
+    (상한가: 체결 거의 안 됨 + 추가 상승 여지 없음 / 하한가: 급락 중)
+    """
+    if change_rate >= 0.29:
+        return Signal(
+            stock_code=stock_code, stock_name=stock_name,
+            action="HOLD", strength=0.0,
+            reasons=[f"상한가 근접 +{change_rate*100:.2f}% (매수 제외)"],
+            price=price,
+        )
+    if change_rate <= -0.29:
+        return Signal(
+            stock_code=stock_code, stock_name=stock_name,
+            action="HOLD", strength=0.0,
+            reasons=[f"하한가 근접 {change_rate*100:.2f}% (매수 제외)"],
+            price=price,
+        )
+
     reasons: list[str] = []
     score = 0.0
 

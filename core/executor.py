@@ -135,6 +135,7 @@ def execute_buy_for_bot(
             client.record_trade({
                 "botId": bot_id,
                 "ticker": code,
+                "stockName": cand.get("stock_name"),
                 "action": "BUY",
                 "price": price,
                 "volume": qty,
@@ -252,6 +253,7 @@ def execute_exits_for_bot(
             client.record_trade({
                 "botId": bot_id,
                 "ticker": code,
+                "stockName": pos.get("stockName"),
                 "action": "SELL",
                 "price": current_price,
                 "volume": qty,
