@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 import logging
+from datetime import datetime
 
 from apscheduler.schedulers.blocking import BlockingScheduler
 
@@ -62,14 +63,17 @@ def main() -> None:
     client = BackendClient()
 
     scheduler = BlockingScheduler(timezone="Asia/Seoul")
-    # 잔고 실시간 반영 — 1분 주기
+    now = datetime.now()
+    # 잔고 실시간 반영 — 즉시 1회 + 이후 60초 주기
     scheduler.add_job(lambda: sync_balances(client), "interval", seconds=60,
-                      id="sync_balances", next_run_time=None, coalesce=True, max_instances=1)
-    # 매매 사이클 — 5분 주기
+                      id="sync_balances", next_run_time=now,
+                      coalesce=True, max_instances=1)
+    # 매매 사이클 — 즉시 1회 + 이후 5분 주기
     scheduler.add_job(lambda: run_trading_cycle(client), "interval", minutes=5,
-                      id="trading_cycle", next_run_time=None, coalesce=True, max_instances=1)
+                      id="trading_cycle", next_run_time=now,
+                      coalesce=True, max_instances=1)
 
-    log.info("스케줄러 시작: sync_balances=60s, trading_cycle=300s")
+    log.info("스케줄러 시작: sync_balances=60s, trading_cycle=300s (첫 실행 즉시)")
 
     try:
         scheduler.start()
