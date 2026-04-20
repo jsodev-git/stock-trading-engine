@@ -1,0 +1,26 @@
+# 키움 OpenAPI+ (Windows COM 전용)
+pykiwoom==0.3.8
+PyQt5==5.15.11
+
+# 데이터 분석
+pandas==2.2.3
+numpy==1.26.4
+
+# 기술적 분석
+ta==0.11.0
+
+# DB
+SQLAlchemy==2.0.36
+psycopg2-binary==2.9.10
+
+# 스케줄링
+APScheduler==3.10.4
+
+# HTTP (Backend REST API 호출)
+requests==2.32.3
+
+# 환경변수
+python-dotenv==1.0.1
+
+# 테스트
+pytest==8.3.4

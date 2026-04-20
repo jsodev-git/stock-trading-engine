@@ -1,0 +1,9 @@
+[project]
+name = "stock-trading-engine"
+version = "0.1.0"
+description = "주식 자동매매 엔진 (키움 OpenAPI+ 기반, Windows 전용)"
+requires-python = ">=3.11"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = "test_*.py"
