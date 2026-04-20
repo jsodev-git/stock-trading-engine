@@ -1,12 +1,13 @@
 """엔진 엔트리 포인트.
 
-실행 흐름:
-1. Backend에서 실행 중인 봇 목록 폴링
-2. 각 봇별로 시장 오픈 여부 확인
-3. 오픈 상태면 broker factory로 적절한 브로커 생성 → 연결 → 1 사이클 수행
-4. 매매 결과는 Backend `/internal/trades`로 전송
+스케줄된 작업:
+- balance sync (60s)  — 실행 중 봇의 잔고·보유종목 스냅샷을 Backend에 기록
+- trading cycle (5min) — 장 오픈 시 스크리닝 → 시그널 → 주문 (단계적 구현)
 
-현재는 루프 골격만 있으며 실제 스크리닝·매매는 각 모듈에서 단계적으로 채운다.
+엔진 ↔ Backend 역할:
+- Backend는 봇 설정/인증정보·DB 저장소를 제공
+- 엔진은 브로커 API 호출·매매 판단·결과 기록 담당
+- 분석용 데이터(스냅샷·매매이력·시그널 로그)는 모두 DB에 남긴다
 """
 from __future__ import annotations
 
@@ -18,6 +19,7 @@ from broker import get_broker
 from config import config
 from core.backend_client import BackendClient
 from core.market_session import is_market_open
+from core.sync_jobs import sync_balances
 
 logging.basicConfig(
     level=logging.INFO,
@@ -26,27 +28,30 @@ logging.basicConfig(
 log = logging.getLogger("engine")
 
 
-def run_cycle(client: BackendClient) -> None:
-    bots = client.get_active_bots()
-    log.info("실행 중 봇 %d개 조회", len(bots))
+def run_trading_cycle(client: BackendClient) -> None:
+    """장 시간일 때만 실행되는 매매 사이클 (스크리닝 → 시그널 → 주문)."""
+    try:
+        bots = client.get_active_bots()
+    except Exception as e:
+        log.warning("[trading] 봇 목록 조회 실패: %s", e)
+        return
 
     for bot in bots:
         market = bot.get("market", "KR")
         if not is_market_open(market):
-            log.debug("[%s] %s 장 마감 상태 — skip", bot.get("name"), market)
             continue
 
         broker_name = bot.get("broker", "KIWOOM")
         account_type = bot.get("accountType", "MOCK")
         credentials = bot.get("credentials") or {}
 
-        log.info("[%s] 사이클 진행 broker=%s market=%s account=%s",
+        log.info("[trading][%s] 사이클 진행 broker=%s market=%s account=%s",
                  bot.get("name"), broker_name, market, account_type)
 
         broker = get_broker(broker_name, market=market, account_type=account_type)
         try:
             broker.connect(credentials)
-            # TODO: 스크리닝 → 시그널 → 주문 → 기록
+            # TODO: 스크리닝(strategy) → 시그널(ai) → 주문 → 매매이력 기록
             _ = broker.get_balance()
         finally:
             broker.disconnect()
@@ -57,7 +62,14 @@ def main() -> None:
     client = BackendClient()
 
     scheduler = BlockingScheduler(timezone="Asia/Seoul")
-    scheduler.add_job(lambda: run_cycle(client), "interval", minutes=5, next_run_time=None)
+    # 잔고 실시간 반영 — 1분 주기
+    scheduler.add_job(lambda: sync_balances(client), "interval", seconds=60,
+                      id="sync_balances", next_run_time=None, coalesce=True, max_instances=1)
+    # 매매 사이클 — 5분 주기
+    scheduler.add_job(lambda: run_trading_cycle(client), "interval", minutes=5,
+                      id="trading_cycle", next_run_time=None, coalesce=True, max_instances=1)
+
+    log.info("스케줄러 시작: sync_balances=60s, trading_cycle=300s")
 
     try:
         scheduler.start()

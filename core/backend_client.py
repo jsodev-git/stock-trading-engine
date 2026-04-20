@@ -45,3 +45,9 @@ class BackendClient:
         url = f"{self.base_url}/api/internal/bots/{bot_id}/target-stock-codes"
         resp = self._session.put(url, json=stock_codes, timeout=10)
         resp.raise_for_status()
+
+    def record_account_snapshot(self, payload: dict[str, Any]) -> None:
+        """봇의 현재 잔고·보유종목 스냅샷을 Backend DB에 기록."""
+        url = f"{self.base_url}/api/internal/account-snapshots"
+        resp = self._session.post(url, json=payload, timeout=10)
+        resp.raise_for_status()
