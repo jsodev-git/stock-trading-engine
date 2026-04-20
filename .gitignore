@@ -3,6 +3,7 @@ __pycache__/
 *.pyo
 *.pyd
 .env
+.kis_tokens.json
 venv/
 .venv/
 *.log

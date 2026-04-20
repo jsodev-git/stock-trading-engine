@@ -12,7 +12,9 @@
 from __future__ import annotations
 
 import logging
+import logging.handlers
 from datetime import datetime
+from pathlib import Path
 
 from apscheduler.schedulers.blocking import BlockingScheduler
 
@@ -22,10 +24,26 @@ from core.backend_client import BackendClient
 from core.market_session import is_market_open
 from core.sync_jobs import sync_balances
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-)
+LOG_FILE = Path(__file__).resolve().parent / "engine.log"
+_FORMATTER = logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+
+# 루트 로거에 stdout + rotating file handler 부착
+_root = logging.getLogger()
+_root.setLevel(logging.INFO)
+if not _root.handlers:
+    _stream = logging.StreamHandler()
+    _stream.setFormatter(_FORMATTER)
+    _root.addHandler(_stream)
+
+    _file = logging.handlers.RotatingFileHandler(
+        LOG_FILE, maxBytes=5_000_000, backupCount=3, encoding="utf-8"
+    )
+    _file.setFormatter(_FORMATTER)
+    _root.addHandler(_file)
+
+# APScheduler의 도배성 "Running job..." 정보는 warning 이상만 출력
+logging.getLogger("apscheduler.executors.default").setLevel(logging.WARNING)
+
 log = logging.getLogger("engine")
 
 
@@ -44,18 +62,12 @@ def run_trading_cycle(client: BackendClient) -> None:
 
         broker_name = bot.get("broker", "KIWOOM")
         account_type = bot.get("accountType", "MOCK")
-        credentials = bot.get("credentials") or {}
 
         log.info("[trading][%s] 사이클 진행 broker=%s market=%s account=%s",
                  bot.get("name"), broker_name, market, account_type)
-
-        broker = get_broker(broker_name, market=market, account_type=account_type)
-        try:
-            broker.connect(credentials)
-            # TODO: 스크리닝(strategy) → 시그널(ai) → 주문 → 매매이력 기록
-            _ = broker.get_balance()
-        finally:
-            broker.disconnect()
+        # TODO: 스크리닝(strategy) → 시그널(ai) → 주문 → 매매이력 기록.
+        # 실제 매매 로직 구현 시 이 위치에 broker.connect() + 주문 호출 추가.
+        # 지금은 sync_balances가 잔고 동기화를 담당하므로 여기서는 브로커 호출 생략.
 
 
 def main() -> None:

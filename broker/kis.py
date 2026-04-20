@@ -13,9 +13,12 @@ KIS는 REST API 기반이라 OS 제약이 없다. AppKey/AppSecret로 OAuth 토�
 """
 from __future__ import annotations
 
+import json
 import logging
+import threading
 import time
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
+from pathlib import Path
 from typing import Any
 
 import requests
@@ -41,7 +44,12 @@ class _Token:
 
 
 class KISBroker(BaseBroker):
-    """한국투자증권 KIS Developers REST 연동."""
+    """한국투자증권 KIS Developers REST 연동.
+
+    KIS는 토큰 발급을 1분 1회로 제한하므로, 같은 (appKey, account_type) 조합은
+    프로세스 전역에서 토큰을 공유한다. 그렇지 않으면 sync_balances와 trading_cycle이
+    동시에 실행될 때 한쪽이 403을 받는다.
+    """
 
     name = BrokerName.KIS
 
@@ -49,6 +57,12 @@ class KISBroker(BaseBroker):
     BASE_URL_MOCK = "https://openapivts.koreainvestment.com:29443"
 
     TIMEOUT = 10  # seconds
+
+    # (app_key, account_type) → Token. 클래스 레벨로 공유
+    _TOKEN_CACHE: dict[tuple[str, str], _Token] = {}
+    _TOKEN_LOCK = threading.Lock()
+    # 프로세스 재시작 시 rate limit을 피하려면 파일에 영속화
+    _TOKEN_STORE = Path(__file__).resolve().parents[1] / ".kis_tokens.json"
 
     def __init__(self, market: Market = Market.KR,
                  account_type: AccountType = AccountType.MOCK) -> None:
@@ -89,28 +103,88 @@ class KISBroker(BaseBroker):
 
     def disconnect(self) -> None:
         log.info("KIS 연결 해제")
+        # 인스턴스 참조만 끊고 토큰 캐시는 유지 (다른 인스턴스가 재사용)
         self._token = None
 
     # ─── 인증 ───
 
     def _fetch_token(self) -> None:
-        """access_token 발급. 하루 1회 호출 권장 (KIS는 빈번 호출 시 오류 반환)."""
-        url = f"{self.base_url}/oauth2/tokenP"
-        body = {
-            "grant_type": "client_credentials",
-            "appkey": self._app_key,
-            "appsecret": self._app_secret,
-        }
-        resp = self._session.post(url, json=body, timeout=self.TIMEOUT)
-        if resp.status_code != 200:
-            raise RuntimeError(f"KIS 토큰 발급 실패: {resp.status_code} {resp.text}")
-        data = resp.json()
-        # expires_in: 초 단위. 보수적으로 5분 일찍 만료 처리
-        expires_in = int(data.get("expires_in", 86400))
-        self._token = _Token(
-            value=data["access_token"],
-            expires_at=time.time() + max(0, expires_in - 300),
-        )
+        """access_token 발급. 메모리 캐시 → 디스크 캐시 → 신규 발급 순으로 조회하며,
+        클래스 락으로 동시 호출을 직렬화한다. 디스크 캐시는 프로세스 재시작 시에도
+        토큰을 재사용해 KIS의 1분 발급 제한을 우회한다.
+        """
+        assert self._app_key is not None
+        cache_key = (self._app_key, self.account_type.value)
+
+        # fast path: 락 없이 메모리 캐시 히트
+        cached = self._TOKEN_CACHE.get(cache_key)
+        if cached and time.time() < cached.expires_at:
+            self._token = cached
+            return
+
+        with self._TOKEN_LOCK:
+            # 락 대기 중 다른 스레드가 발급받았을 수 있음
+            cached = self._TOKEN_CACHE.get(cache_key)
+            if cached and time.time() < cached.expires_at:
+                self._token = cached
+                return
+
+            # 디스크 캐시 시도
+            disk_token = self._load_disk_token(cache_key)
+            if disk_token and time.time() < disk_token.expires_at:
+                self._token = disk_token
+                self._TOKEN_CACHE[cache_key] = disk_token
+                log.info("KIS 토큰 디스크 캐시 재사용 (%s, %ds 남음)",
+                         self.account_type.value,
+                         int(disk_token.expires_at - time.time()))
+                return
+
+            # 실제 발급
+            url = f"{self.base_url}/oauth2/tokenP"
+            body = {
+                "grant_type": "client_credentials",
+                "appkey": self._app_key,
+                "appsecret": self._app_secret,
+            }
+            resp = self._session.post(url, json=body, timeout=self.TIMEOUT)
+            if resp.status_code != 200:
+                raise RuntimeError(f"KIS 토큰 발급 실패: {resp.status_code} {resp.text}")
+            data = resp.json()
+            expires_in = int(data.get("expires_in", 86400))
+            token = _Token(
+                value=data["access_token"],
+                expires_at=time.time() + max(0, expires_in - 300),
+            )
+            self._token = token
+            self._TOKEN_CACHE[cache_key] = token
+            self._save_disk_token(cache_key, token)
+            log.info("KIS 토큰 신규 발급 (%s)", self.account_type.value)
+
+    @classmethod
+    def _load_disk_token(cls, cache_key: tuple[str, str]) -> _Token | None:
+        try:
+            if not cls._TOKEN_STORE.exists():
+                return None
+            raw = json.loads(cls._TOKEN_STORE.read_text(encoding="utf-8"))
+            key_str = f"{cache_key[0]}|{cache_key[1]}"
+            entry = raw.get(key_str)
+            if not entry:
+                return None
+            return _Token(value=entry["value"], expires_at=float(entry["expires_at"]))
+        except Exception as e:
+            log.debug("디스크 토큰 로드 실패: %s", e)
+            return None
+
+    @classmethod
+    def _save_disk_token(cls, cache_key: tuple[str, str], token: _Token) -> None:
+        try:
+            raw: dict[str, Any] = {}
+            if cls._TOKEN_STORE.exists():
+                raw = json.loads(cls._TOKEN_STORE.read_text(encoding="utf-8"))
+            raw[f"{cache_key[0]}|{cache_key[1]}"] = asdict(token)
+            cls._TOKEN_STORE.write_text(json.dumps(raw), encoding="utf-8")
+        except Exception as e:
+            log.warning("디스크 토큰 저장 실패: %s", e)
 
     def _auth_headers(self, tr_id: str) -> dict[str, str]:
         self._ensure_token()
