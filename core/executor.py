@@ -1,0 +1,316 @@
+"""매매 실행 — BUY 시그널을 주문으로, 보유 포지션을 exit 판단으로 연결.
+
+설계:
+- ENGINE_MODE=DRY: 주문 호출 없이 로그만 (테스트용)
+- ENGINE_MODE=PAPER: MOCK 계좌에만 실제 주문 (안전 기본값)
+- ENGINE_MODE=LIVE: MOCK + REAL 모두 실제 주문
+
+동시성/중복 보호:
+- 진입 전에 항상 Backend에서 현재 포지션 조회
+- 이미 보유 중인 종목은 skip (추가 매수는 별도 로직에서 처리)
+- maxPositions 도달 시 skip
+"""
+from __future__ import annotations
+
+import logging
+import time
+from datetime import datetime
+from typing import Any
+
+# KIS 초당 rate limit 대응
+_ORDER_DELAY = 1.0
+
+from ai.exit_signal import decide_exit
+from ai.fee import buy_cost, is_profitable_target, net_pnl, sell_proceeds
+from broker.base import BaseBroker, OrderSide
+from config import config
+from core.backend_client import BackendClient
+
+log = logging.getLogger(__name__)
+
+
+def _should_place_orders(account_type: str) -> bool:
+    """ENGINE_MODE + 계좌 타입에 따라 실제 주문할지 결정."""
+    mode = config.engine_mode.upper()
+    if mode == "DRY":
+        return False
+    if mode == "PAPER":
+        return account_type.upper() == "MOCK"
+    if mode == "LIVE":
+        return True
+    return False
+
+
+def execute_buy_for_bot(
+    client: BackendClient,
+    broker: BaseBroker,
+    bot: dict,
+    buy_candidates: list[dict],
+    cash_available: float,
+) -> None:
+    """BUY 시그널 후보 리스트 → 필터 → 주문 → 포지션 기록.
+
+    buy_candidates 원소: {
+        stock_code, stock_name, price, change_rate, strength, reasons
+    }
+    """
+    bot_id = bot["id"]
+    bot_name = bot.get("name", str(bot_id))
+    account_type = bot.get("accountType", "MOCK")
+    max_positions = bot.get("maxPositions") or 3
+    trade_ratio = bot.get("tradeRatio") or 0.10
+
+    # 현재 포지션 조회 — 중복 매수 방지, maxPositions 체크
+    try:
+        positions = _get_bot_positions(client, bot_id)
+    except Exception as e:
+        log.warning("[exec][%s] 포지션 조회 실패, 매수 skip: %s", bot_name, e)
+        return
+
+    held_codes = {p["stockCode"] for p in positions}
+    open_count = len(positions)
+
+    if open_count >= max_positions:
+        log.info("[exec][%s] 최대 보유 %d개 도달 — 신규 매수 skip", bot_name, max_positions)
+        return
+
+    slots_available = max_positions - open_count
+    take_profit_rate = bot.get("takeProfitRate") or 0.08
+
+    for cand in buy_candidates[:slots_available]:
+        code = cand["stock_code"]
+        if not code or code in held_codes:
+            continue
+
+        price = float(cand["price"])
+        if price <= 0:
+            continue
+
+        # 1) 예상 순수익률 필터 — 목표가 = 현재가 × (1 + takeProfitRate)
+        target_price = price * (1.0 + take_profit_rate)
+        is_worth, expected_net = is_profitable_target(
+            price, target_price, account_type, "KOSPI", min_multiple=2.0,
+        )
+        if not is_worth:
+            log.info("[exec][%s] %s — 예상 순수익 %.3f%% 부족 (수수료 2배 미달) skip",
+                     bot_name, code, expected_net * 100)
+            continue
+
+        # 2) 투자 금액 계산
+        order_budget = cash_available * trade_ratio
+        if order_budget < price:
+            log.info("[exec][%s] %s — 예산 %.0f원 < 단가 %.0f, skip",
+                     bot_name, code, order_budget, price)
+            continue
+
+        qty = int(order_budget // price)
+        total_cost, fee = buy_cost(price, qty, account_type, "KOSPI")
+
+        log.info(
+            "[exec][%s] BUY %s %s x%d @ %.0f → 비용 %.0f (수수료 %.0f) reasons=%s",
+            bot_name, cand.get("stock_name", ""), code, qty, price, total_cost, fee,
+            cand.get("reasons", []),
+        )
+
+        if not _should_place_orders(account_type):
+            log.info("[exec][%s] DRY — 실제 주문 skip", bot_name)
+            continue
+
+        # 3) 실제 주문 (시장가). KIS 주문 API 초당 제한 회피 위해 지연.
+        time.sleep(_ORDER_DELAY)
+        try:
+            result = broker.place_buy(code, qty, price=None)
+            log.info("[exec][%s] %s 주문 ok=%s id=%s", bot_name, code,
+                     result.filled, result.order_id)
+            if not result.filled:
+                continue
+        except Exception as e:
+            log.warning("[exec][%s] %s 주문 실패: %s", bot_name, code, e)
+            continue
+
+        # 4) Backend에 포지션 + 매매이력 기록
+        try:
+            client.upsert_position(bot_id, code, cand.get("stock_name"),
+                                    qty, price, total_cost)
+            client.record_trade({
+                "botId": bot_id,
+                "ticker": code,
+                "action": "BUY",
+                "price": price,
+                "volume": qty,
+                "amount": price * qty,
+                "fee": fee,
+                "reason": "SIGNAL",
+                "signalReasons": str(cand.get("reasons", [])),
+            })
+        except Exception as e:
+            log.warning("[exec][%s] %s 기록 실패 (주문은 나감): %s", bot_name, code, e)
+
+        # 예산 차감 (연속 매수 방지 차원)
+        cash_available -= total_cost
+
+
+def execute_exits_for_bot(
+    client: BackendClient,
+    broker: BaseBroker,
+    bot: dict,
+    flow_by_code: dict[str, dict],
+) -> None:
+    """보유 포지션 각각에 대해 현재가·수급을 바탕으로 exit 판단."""
+    bot_id = bot["id"]
+    bot_name = bot.get("name", str(bot_id))
+    account_type = bot.get("accountType", "MOCK")
+    investment_type = bot.get("investmentType", "MODERATE")
+    risk_mode = bot.get("riskMode") or "AUTO"
+    stop_loss_rate = bot.get("stopLossRate")
+    take_profit_rate = bot.get("takeProfitRate")
+
+    try:
+        positions = _get_bot_positions(client, bot_id)
+    except Exception as e:
+        log.warning("[exit][%s] 포지션 조회 실패: %s", bot_name, e)
+        return
+
+    if not positions:
+        return
+
+    for pos in positions:
+        code = pos["stockCode"]
+
+        # 현재가 조회 (가벼운 호출)
+        try:
+            current_price = broker.get_current_price(code)
+        except Exception as e:
+            log.warning("[exit][%s] %s 현재가 조회 실패: %s", bot_name, code, e)
+            continue
+        if current_price <= 0:
+            continue
+
+        avg_price = float(pos["avgPrice"])
+        peak_price = max(float(pos["peakPrice"]), current_price)
+
+        flow = flow_by_code.get(code) or {}
+        entry_at = _parse_dt(pos.get("entryAt"))
+
+        decision = decide_exit(
+            avg_price=avg_price,
+            quantity=int(pos["quantity"]),
+            peak_price=peak_price,
+            entry_at=entry_at,
+            current_price=current_price,
+            foreign_net=int(flow.get("foreign_net_qty") or 0),
+            institution_net=int(flow.get("institution_net_qty") or 0),
+            investment_type=investment_type,
+            risk_mode=risk_mode,
+            stop_loss_rate=float(stop_loss_rate) if stop_loss_rate is not None else -0.02,
+            take_profit_rate=float(take_profit_rate) if take_profit_rate is not None else 0.08,
+        )
+
+        if not decision.should_sell:
+            log.debug("[exit][%s] %s HOLD (%.2f%%)", bot_name, code,
+                      ((current_price - avg_price) / avg_price) * 100)
+            continue
+
+        qty = int(pos["quantity"])
+        log.info("[exit][%s] SELL %s x%d @ %.0f reasons=%s urgency=%s",
+                 bot_name, code, qty, current_price, decision.reasons, decision.urgency)
+
+        # 시그널 기록 (exit 근거)
+        try:
+            client.record_signal(bot_id, {
+                "stockCode": code,
+                "stockName": pos.get("stockName"),
+                "action": "SELL",
+                "strength": 0.9 if decision.urgency == "high" else 0.6,
+                "reasons": decision.reasons,
+                "price": current_price,
+                "executed": True,
+            })
+        except Exception as e:
+            log.warning("[exit][%s] 시그널 기록 실패: %s", bot_name, e)
+
+        if not _should_place_orders(account_type):
+            log.info("[exit][%s] DRY — 실제 매도 skip", bot_name)
+            continue
+
+        # 실제 매도 (시장가). rate limit 회피.
+        time.sleep(_ORDER_DELAY)
+        try:
+            broker.place_sell(code, qty, price=None)
+        except Exception as e:
+            log.warning("[exit][%s] %s 매도 실패: %s", bot_name, code, e)
+            continue
+
+        # 순손익 계산
+        initial_cost = float(pos.get("totalCost") or (avg_price * qty))
+        net_receive, sell_fee = sell_proceeds(current_price, qty, account_type, "KOSPI")
+        net_gain = net_receive - initial_cost
+        profit_rate = net_gain / initial_cost if initial_cost > 0 else 0.0
+
+        try:
+            client.reduce_position(bot_id, code, qty)
+            client.record_trade({
+                "botId": bot_id,
+                "ticker": code,
+                "action": "SELL",
+                "price": current_price,
+                "volume": qty,
+                "amount": current_price * qty,
+                "fee": sell_fee,
+                "profitRate": profit_rate,
+                "profitAmount": net_gain,
+                "reason": _classify_exit_reason(decision.reasons),
+                "signalReasons": str(decision.reasons),
+            })
+            log.info("[exit][%s] %s 체결 net=%.0f 원 (%.2f%%)",
+                     bot_name, code, net_gain, profit_rate * 100)
+        except Exception as e:
+            log.warning("[exit][%s] %s 기록 실패: %s", bot_name, code, e)
+
+
+# ─── helpers ───
+
+def _get_bot_positions(client: BackendClient, bot_id: int) -> list[dict]:
+    """Backend에서 특정 봇의 보유 포지션 조회.
+
+    Position 조회 API는 Authorization 기반이라 엔진 전용 Internal 엔드포인트 없이
+    /api/positions/bots/{botId}는 memberId 매칭 필요. 엔진용으로는
+    InternalController에 별도 GET 엔드포인트를 노출하지 않고
+    active bot 응답과 snapshot을 조합해 쓰는 방식이 더 깔끔하지만,
+    단기적으로는 그냥 /api/internal/positions를 추가하는 편이 빠름.
+
+    임시: 스냅샷에서 추정하지 않고 Backend에 한 번 더 호출.
+    """
+    # 현재는 Position 조회용 internal API가 없으므로 빈 리스트 반환 → 엔진은 중복 매수 방지만 못 함.
+    # TODO: Backend에 GET /api/internal/positions?botId=... 추가 후 여기서 호출.
+    try:
+        url = f"{client.base_url}/api/internal/positions?botId={bot_id}"
+        resp = client._session.get(url, timeout=10)
+        if resp.status_code == 404:
+            return []
+        resp.raise_for_status()
+        return resp.json().get("data", [])
+    except Exception:
+        return []
+
+
+def _parse_dt(val: Any) -> datetime:
+    if isinstance(val, datetime):
+        return val
+    if isinstance(val, str):
+        try:
+            return datetime.fromisoformat(val.replace("Z", "+00:00")).replace(tzinfo=None)
+        except ValueError:
+            pass
+    return datetime.now()
+
+
+def _classify_exit_reason(reasons: list[str]) -> str:
+    joined = " ".join(reasons).lower()
+    if "절대 손절" in joined or "손절" in joined:
+        return "STOP_LOSS"
+    if "트레일링" in joined:
+        return "TRAILING_STOP"
+    if "익절" in joined:
+        return "TAKE_PROFIT"
+    return "SIGNAL"

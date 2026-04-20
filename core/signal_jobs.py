@@ -18,9 +18,10 @@ from ai.signal import score_buy_candidate
 from broker import get_broker
 from broker.base import BaseBroker
 from core.backend_client import BackendClient
+from core.executor import execute_buy_for_bot, execute_exits_for_bot
 
 # KIS는 초당 API 요청 수가 제한돼 있어 각 호출 사이 지연
-_KIS_CALL_DELAY = 0.3
+_KIS_CALL_DELAY = 1.0
 
 log = logging.getLogger(__name__)
 
@@ -97,6 +98,8 @@ def scan_and_signal_kr(client: BackendClient, top_n: int = 30) -> None:
 
         log.info("[signal_job] 핫 종목 %d개 분석", len(hot_codes))
 
+        time.sleep(_KIS_CALL_DELAY)  # price_rankers → flow 사이 지연
+
         flow_by_code: dict[str, dict] = {}
         for code in hot_codes:
             try:
@@ -111,11 +114,12 @@ def scan_and_signal_kr(client: BackendClient, top_n: int = 30) -> None:
             log.info("[signal_job] 핫 종목 없음, 시그널 생성 skip")
             return
 
-        # 3. 봇별 시그널 생성
+        # 3. 봇별 시그널 생성 + 실행
         for bot in kr_bots:
             threshold = _BUY_THRESHOLD.get(bot.get("investmentType", "MODERATE"), 0.5)
             bot_id = bot["id"]
             generated = 0
+            buy_candidates: list[dict[str, Any]] = []
             for code in hot_codes:
                 v = volume_by_code.get(code) or {}
                 p = price_by_code.get(code) or {}
@@ -135,7 +139,6 @@ def scan_and_signal_kr(client: BackendClient, top_n: int = 30) -> None:
                     individual_net=f.get("individual_net_qty", 0),
                     ranker_size=top_n,
                 )
-                # threshold 미만이면 HOLD로 다운그레이드 (DB에 축적되지만 실행되지 않음)
                 action = "BUY" if signal.strength >= threshold else "HOLD"
                 payload: dict[str, Any] = {
                     "stockCode": signal.stock_code,
@@ -144,7 +147,7 @@ def scan_and_signal_kr(client: BackendClient, top_n: int = 30) -> None:
                     "strength": signal.strength,
                     "reasons": signal.reasons,
                     "price": signal.price,
-                    "executed": False,  # 실행 로직은 별도 잡 (추후 구현)
+                    "executed": False,
                 }
                 try:
                     client.record_signal(bot_id, payload)
@@ -152,10 +155,61 @@ def scan_and_signal_kr(client: BackendClient, top_n: int = 30) -> None:
                 except Exception as e:
                     log.warning("[signal_job] 시그널 저장 실패 bot=%s %s: %s",
                                 bot_id, code, e)
-            log.info("[signal_job][%s] %d개 시그널 (threshold=%.2f)",
-                     bot.get("name"), generated, threshold)
+
+                if action == "BUY":
+                    buy_candidates.append({
+                        "stock_code": signal.stock_code,
+                        "stock_name": signal.stock_name,
+                        "price": signal.price,
+                        "change_rate": p.get("change_rate") or 0,
+                        "strength": signal.strength,
+                        "reasons": signal.reasons,
+                    })
+
+            log.info("[signal_job][%s] %d개 시그널 (threshold=%.2f, BUY %d)",
+                     bot.get("name"), generated, threshold, len(buy_candidates))
+
+            # 실행 — 각 봇마다 자체 브로커 세션
+            _execute_for_bot(client, bot, buy_candidates, flow_by_code)
     finally:
         try:
             broker.disconnect()
+        except Exception:
+            pass
+
+
+def _execute_for_bot(client: BackendClient, bot: dict,
+                      buy_candidates: list[dict[str, Any]],
+                      flow_by_code: dict[str, dict]) -> None:
+    """봇 전용 브로커 세션으로 BUY/Exit 주문 수행."""
+    bot_name = bot.get("name", str(bot["id"]))
+    broker_name = bot.get("broker", "KIS")
+    market = bot.get("market", "KR")
+    account_type = bot.get("accountType", "MOCK")
+    credentials = bot.get("credentials") or {}
+
+    try:
+        bot_broker = get_broker(broker_name, market=market, account_type=account_type)
+        bot_broker.connect(credentials)
+    except Exception as e:
+        log.warning("[signal_job][%s] 브로커 연결 실패: %s", bot_name, e)
+        return
+
+    try:
+        # 1. Exit 먼저 — 새 진입 전 청산부터
+        execute_exits_for_bot(client, bot_broker, bot, flow_by_code)
+
+        # 2. 진입 — 가용 현금 확인 후
+        balance = None
+        try:
+            balance = bot_broker.get_balance()
+        except Exception as e:
+            log.warning("[signal_job][%s] 잔고 조회 실패, BUY skip: %s", bot_name, e)
+
+        if balance and buy_candidates:
+            execute_buy_for_bot(client, bot_broker, bot, buy_candidates, balance.cash)
+    finally:
+        try:
+            bot_broker.disconnect()
         except Exception:
             pass

@@ -86,6 +86,26 @@ class BackendClient:
         resp = self._session.post(url, json=payload, timeout=10)
         resp.raise_for_status()
 
+    def upsert_position(self, bot_id: int, stock_code: str, stock_name: str | None,
+                        added_qty: int, added_price: float, added_cost: float) -> None:
+        url = f"{self.base_url}/api/internal/positions/upsert"
+        payload = {
+            "botId": bot_id,
+            "stockCode": stock_code,
+            "stockName": stock_name,
+            "addedQuantity": added_qty,
+            "addedPrice": added_price,
+            "addedCost": added_cost,
+        }
+        resp = self._session.post(url, json=payload, timeout=10)
+        resp.raise_for_status()
+
+    def reduce_position(self, bot_id: int, stock_code: str, sold_qty: int) -> None:
+        url = f"{self.base_url}/api/internal/positions/reduce"
+        payload = {"botId": bot_id, "stockCode": stock_code, "soldQuantity": sold_qty}
+        resp = self._session.post(url, json=payload, timeout=10)
+        resp.raise_for_status()
+
     def record_signal(self, bot_id: int, signal: dict[str, Any]) -> None:
         """매매 시그널 저장."""
         payload = {
