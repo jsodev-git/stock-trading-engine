@@ -21,6 +21,14 @@ import os
 import sys
 from pathlib import Path
 
+# Windows 기본 콘솔(cp949)에서 한글/이모지가 깨지지 않도록 UTF-8 강제
+if sys.stdout.encoding and sys.stdout.encoding.lower() != "utf-8":
+    try:
+        sys.stdout.reconfigure(encoding="utf-8")
+        sys.stderr.reconfigure(encoding="utf-8")
+    except AttributeError:
+        pass
+
 # trading/ 을 sys.path 에 추가
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
