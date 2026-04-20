@@ -51,3 +51,53 @@ class BackendClient:
         url = f"{self.base_url}/api/internal/account-snapshots"
         resp = self._session.post(url, json=payload, timeout=10)
         resp.raise_for_status()
+
+    def record_scan_batch(self, rank_by: str, entries: list[dict[str, Any]]) -> None:
+        """스크리닝 결과 일괄 전송. rank_by: VOLUME / PRICE_CHANGE / TRADE_AMOUNT."""
+        payload = {
+            "rankBy": rank_by,
+            "entries": [
+                {
+                    "stockCode": e["stock_code"],
+                    "stockName": e.get("stock_name"),
+                    "rankPosition": e["rank"],
+                    "price": e.get("price", 0.0),
+                    "changeRate": e.get("change_rate", 0.0),
+                    "volume": e.get("volume", 0),
+                    "tradeAmount": e.get("trade_amount", 0.0),
+                }
+                for e in entries
+            ],
+        }
+        url = f"{self.base_url}/api/internal/scans"
+        resp = self._session.post(url, json=payload, timeout=10)
+        resp.raise_for_status()
+
+    def record_flow(self, stock_code: str, flow: dict[str, int]) -> None:
+        """종목 수급 데이터 저장."""
+        payload = {
+            "stockCode": stock_code,
+            "foreignNetQty": flow.get("foreign_net_qty", 0),
+            "institutionNetQty": flow.get("institution_net_qty", 0),
+            "individualNetQty": flow.get("individual_net_qty", 0),
+            "programNetQty": flow.get("program_net_qty"),
+        }
+        url = f"{self.base_url}/api/internal/flows"
+        resp = self._session.post(url, json=payload, timeout=10)
+        resp.raise_for_status()
+
+    def record_signal(self, bot_id: int, signal: dict[str, Any]) -> None:
+        """매매 시그널 저장."""
+        payload = {
+            "botId": bot_id,
+            "stockCode": signal["stockCode"],
+            "stockName": signal.get("stockName"),
+            "action": signal["action"],
+            "strength": signal["strength"],
+            "reasons": signal.get("reasons", []),
+            "price": signal.get("price"),
+            "executed": signal.get("executed", False),
+        }
+        url = f"{self.base_url}/api/internal/signals"
+        resp = self._session.post(url, json=payload, timeout=10)
+        resp.raise_for_status()

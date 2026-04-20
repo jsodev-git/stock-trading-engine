@@ -1,0 +1,161 @@
+"""봇별 시그널 생성 잡.
+
+동작:
+1. Backend에서 실행 중 봇 목록 조회 (credentials 포함)
+2. Backend `/api/signals/scan`은 memberId 필요한 API라 내부 DB 조회를 엔진이 직접 하지 않고,
+   엔진은 scanner가 방금 저장한 스캔/수급을 다시 호출하는 대신, 로컬에서 결과를 전달받아
+   곧장 점수 계산 후 Backend에 시그널 저장.
+
+   → scan_and_signal_kr가 scan_kr_market의 결과를 반환하도록 하면 중복 호출 없음.
+"""
+from __future__ import annotations
+
+import logging
+import time
+from typing import Any
+
+from ai.signal import score_buy_candidate
+from broker import get_broker
+from broker.base import BaseBroker
+from core.backend_client import BackendClient
+
+# KIS는 초당 API 요청 수가 제한돼 있어 각 호출 사이 지연
+_KIS_CALL_DELAY = 0.3
+
+log = logging.getLogger(__name__)
+
+# 투자성향별 BUY 임계값
+_BUY_THRESHOLD = {
+    "AGGRESSIVE": 0.35,
+    "MODERATE": 0.50,
+    "CONSERVATIVE": 0.65,
+}
+
+
+def _pick_kr_kis_broker(bots: list[dict]) -> BaseBroker | None:
+    for bot in bots:
+        if bot.get("market") != "KR" or bot.get("broker") != "KIS":
+            continue
+        creds = bot.get("credentials") or {}
+        if not creds.get("appKey"):
+            continue
+        broker = get_broker("KIS", market="KR", account_type=bot.get("accountType", "MOCK"))
+        broker.connect(creds)
+        return broker
+    return None
+
+
+def scan_and_signal_kr(client: BackendClient, top_n: int = 30) -> None:
+    """KR 시장 스캔 + 봇별 시그널 생성·저장.
+
+    이 한 잡 안에서 스캔→수급→시그널까지 묶어 KIS rate limit을 최소화한다.
+    """
+    try:
+        bots = client.get_active_bots()
+    except Exception as e:
+        log.warning("[signal_job] 봇 목록 조회 실패: %s", e)
+        return
+
+    kr_bots = [b for b in bots if b.get("market") == "KR"]
+    if not kr_bots:
+        log.debug("[signal_job] KR 봇 없음 — skip")
+        return
+
+    broker = _pick_kr_kis_broker(kr_bots)
+    if broker is None:
+        log.debug("[signal_job] KIS 브로커 없음 — skip")
+        return
+
+    try:
+        # 1. 스크리너
+        try:
+            volume_rows = broker.get_volume_rankers(top_n)
+            client.record_scan_batch("VOLUME", volume_rows)
+            log.info("[signal_job] 거래량 상위 %d건 저장", len(volume_rows))
+        except Exception as e:
+            log.warning("[signal_job] 거래량 상위 실패: %s", e)
+            volume_rows = []
+
+        time.sleep(_KIS_CALL_DELAY)
+
+        try:
+            price_rows = broker.get_price_change_rankers(top_n)
+            client.record_scan_batch("PRICE_CHANGE", price_rows)
+            log.info("[signal_job] 등락률 상위 %d건 저장", len(price_rows))
+        except Exception as e:
+            log.warning("[signal_job] 등락률 상위 실패: %s", e)
+            price_rows = []
+
+        # 2. 후보 종목 (거래량 ∩ 등락률 교집합 상위 10개) + 수급
+        volume_by_code: dict[str, dict] = {r["stock_code"]: r for r in volume_rows}
+        price_by_code: dict[str, dict] = {r["stock_code"]: r for r in price_rows}
+        hot_codes = list(set(volume_by_code) & set(price_by_code))
+
+        # 등락률 상위 순으로 정렬
+        hot_codes.sort(key=lambda c: price_by_code[c]["rank"])
+        hot_codes = hot_codes[:10]  # KIS rate limit 고려
+
+        log.info("[signal_job] 핫 종목 %d개 분석", len(hot_codes))
+
+        flow_by_code: dict[str, dict] = {}
+        for code in hot_codes:
+            try:
+                flow = broker.get_investor_flow(code)
+                flow_by_code[code] = flow
+                client.record_flow(code, flow)
+            except Exception as e:
+                log.warning("[signal_job] 수급 조회 실패 %s: %s", code, e)
+            time.sleep(_KIS_CALL_DELAY)
+
+        if not hot_codes:
+            log.info("[signal_job] 핫 종목 없음, 시그널 생성 skip")
+            return
+
+        # 3. 봇별 시그널 생성
+        for bot in kr_bots:
+            threshold = _BUY_THRESHOLD.get(bot.get("investmentType", "MODERATE"), 0.5)
+            bot_id = bot["id"]
+            generated = 0
+            for code in hot_codes:
+                v = volume_by_code.get(code) or {}
+                p = price_by_code.get(code) or {}
+                f = flow_by_code.get(code) or {
+                    "foreign_net_qty": 0, "institution_net_qty": 0,
+                    "individual_net_qty": 0,
+                }
+                signal = score_buy_candidate(
+                    stock_code=code,
+                    stock_name=v.get("stock_name") or p.get("stock_name") or "",
+                    price=p.get("price") or v.get("price") or 0,
+                    change_rate=p.get("change_rate") or v.get("change_rate") or 0,
+                    volume_rank=v.get("rank"),
+                    price_rank=p.get("rank"),
+                    foreign_net=f.get("foreign_net_qty", 0),
+                    institution_net=f.get("institution_net_qty", 0),
+                    individual_net=f.get("individual_net_qty", 0),
+                    ranker_size=top_n,
+                )
+                # threshold 미만이면 HOLD로 다운그레이드 (DB에 축적되지만 실행되지 않음)
+                action = "BUY" if signal.strength >= threshold else "HOLD"
+                payload: dict[str, Any] = {
+                    "stockCode": signal.stock_code,
+                    "stockName": signal.stock_name,
+                    "action": action,
+                    "strength": signal.strength,
+                    "reasons": signal.reasons,
+                    "price": signal.price,
+                    "executed": False,  # 실행 로직은 별도 잡 (추후 구현)
+                }
+                try:
+                    client.record_signal(bot_id, payload)
+                    generated += 1
+                except Exception as e:
+                    log.warning("[signal_job] 시그널 저장 실패 bot=%s %s: %s",
+                                bot_id, code, e)
+            log.info("[signal_job][%s] %d개 시그널 (threshold=%.2f)",
+                     bot.get("name"), generated, threshold)
+    finally:
+        try:
+            broker.disconnect()
+        except Exception:
+            pass

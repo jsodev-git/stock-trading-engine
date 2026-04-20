@@ -275,6 +275,112 @@ class KISBroker(BaseBroker):
         data = resp.json().get("output") or {}
         return float(data.get("stck_prpr") or 0)
 
+    # ─── 시장 스크리닝 (KRX) ───
+
+    def get_volume_rankers(self, top_n: int = 30) -> list[dict[str, Any]]:
+        """거래량 상위 종목 조회 (TR FHPST01710000, 실·모의 공용).
+
+        반환 필드: stock_code, stock_name, rank, price, change_rate, volume, trade_amount
+        """
+        url = f"{self.base_url}/uapi/domestic-stock/v1/quotations/volume-rank"
+        params = {
+            "FID_COND_MRKT_DIV_CODE": "J",
+            "FID_COND_SCR_DIV_CODE": "20171",
+            "FID_INPUT_ISCD": "0000",     # 전체
+            "FID_DIV_CLS_CODE": "0",      # 전체
+            "FID_BLNG_CLS_CODE": "0",     # 평균거래량
+            "FID_TRGT_CLS_CODE": "111111111",
+            "FID_TRGT_EXLS_CLS_CODE": "0000000000",
+            "FID_INPUT_PRICE_1": "",
+            "FID_INPUT_PRICE_2": "",
+            "FID_VOL_CNT": "",
+            "FID_INPUT_DATE_1": "",
+        }
+        resp = self._session.get(url, headers=self._auth_headers("FHPST01710000"),
+                                 params=params, timeout=self.TIMEOUT)
+        if resp.status_code != 200:
+            raise RuntimeError(f"KIS 거래량 상위 실패: {resp.status_code} {resp.text}")
+
+        rows = resp.json().get("output") or []
+        result: list[dict[str, Any]] = []
+        for i, r in enumerate(rows[:top_n], start=1):
+            price = float(r.get("stck_prpr") or 0)
+            prev_close = float(r.get("prdy_vrss") or 0)  # 전일대비 (부호 포함)
+            change_rate = float(r.get("prdy_ctrt") or 0) / 100.0  # 전일대비율 (%)
+            result.append({
+                "stock_code": (r.get("mksc_shrn_iscd") or r.get("stck_shrn_iscd") or "").strip(),
+                "stock_name": (r.get("hts_kor_isnm") or "").strip(),
+                "rank": i,
+                "price": price,
+                "change_rate": change_rate,
+                "volume": int(r.get("acml_vol") or 0),
+                "trade_amount": float(r.get("acml_tr_pbmn") or 0),
+            })
+        return result
+
+    def get_price_change_rankers(self, top_n: int = 30) -> list[dict[str, Any]]:
+        """등락률 상위 (상승 기준) 조회 (TR FHPST01700000)."""
+        url = f"{self.base_url}/uapi/domestic-stock/v1/ranking/fluctuation"
+        params = {
+            "FID_COND_MRKT_DIV_CODE": "J",
+            "FID_COND_SCR_DIV_CODE": "20170",
+            "FID_INPUT_ISCD": "0000",
+            "FID_RANK_SORT_CLS_CODE": "0",   # 상승률
+            "FID_INPUT_CNT_1": "0",
+            "FID_PRC_CLS_CODE": "0",
+            "FID_INPUT_PRICE_1": "",
+            "FID_INPUT_PRICE_2": "",
+            "FID_VOL_CNT": "",
+            "FID_TRGT_CLS_CODE": "0",
+            "FID_TRGT_EXLS_CLS_CODE": "0",
+            "FID_DIV_CLS_CODE": "0",
+            "FID_RSFL_RATE1": "",
+            "FID_RSFL_RATE2": "",
+        }
+        resp = self._session.get(url, headers=self._auth_headers("FHPST01700000"),
+                                 params=params, timeout=self.TIMEOUT)
+        if resp.status_code != 200:
+            raise RuntimeError(f"KIS 등락률 상위 실패: {resp.status_code} {resp.text}")
+
+        rows = resp.json().get("output") or []
+        result: list[dict[str, Any]] = []
+        for i, r in enumerate(rows[:top_n], start=1):
+            result.append({
+                "stock_code": (r.get("stck_shrn_iscd") or "").strip(),
+                "stock_name": (r.get("hts_kor_isnm") or "").strip(),
+                "rank": i,
+                "price": float(r.get("stck_prpr") or 0),
+                "change_rate": float(r.get("prdy_ctrt") or 0) / 100.0,
+                "volume": int(r.get("acml_vol") or 0),
+                "trade_amount": float(r.get("acml_tr_pbmn") or 0),
+            })
+        return result
+
+    def get_investor_flow(self, stock_code: str) -> dict[str, int]:
+        """종목별 투자자별 매매동향 (TR FHKST01010900).
+
+        반환 필드: foreign_net_qty, institution_net_qty, individual_net_qty, program_net_qty
+        """
+        url = f"{self.base_url}/uapi/domestic-stock/v1/quotations/inquire-investor"
+        params = {"FID_COND_MRKT_DIV_CODE": "J", "FID_INPUT_ISCD": stock_code}
+        resp = self._session.get(url, headers=self._auth_headers("FHKST01010900"),
+                                 params=params, timeout=self.TIMEOUT)
+        if resp.status_code != 200:
+            raise RuntimeError(f"KIS 수급 조회 실패: {resp.status_code} {resp.text}")
+
+        rows = resp.json().get("output") or []
+        if not rows:
+            return {"foreign_net_qty": 0, "institution_net_qty": 0,
+                    "individual_net_qty": 0, "program_net_qty": 0}
+        # 가장 최근 1건만 사용
+        r = rows[0]
+        return {
+            "foreign_net_qty": _to_int_safe(r.get("frgn_ntby_qty")),
+            "institution_net_qty": _to_int_safe(r.get("orgn_ntby_qty")),
+            "individual_net_qty": _to_int_safe(r.get("prsn_ntby_qty")),
+            "program_net_qty": _to_int_safe(r.get("prpr_prgm_ntby_qty")),
+        }
+
     # ─── 주문 ───
 
     def place_buy(self, stock_code: str, quantity: int, price: float | None = None) -> OrderResult:
@@ -340,3 +446,16 @@ class KISBroker(BaseBroker):
     def _ensure_connected(self) -> None:
         if self._token is None:
             raise RuntimeError("KIS 브로커가 연결되지 않았습니다. connect() 먼저 호출하세요.")
+
+
+def _to_int_safe(value: Any) -> int:
+    """KIS 응답은 문자열 정수(부호 포함, 공백/콤마 섞임) 형식이라 안전 변환."""
+    if value is None:
+        return 0
+    s = str(value).strip().replace(",", "")
+    if not s:
+        return 0
+    try:
+        return int(float(s))
+    except (ValueError, TypeError):
+        return 0
