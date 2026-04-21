@@ -70,6 +70,13 @@ def execute_buy_for_bot(
     held_codes = {p["stockCode"] for p in positions}
     open_count = len(positions)
 
+    # 매매불가 블랙리스트 — KIS 모의/실계좌별 최근 24h 주문 실패 종목 skip
+    try:
+        blacklist = set(client.get_blacklist(account_type))
+    except Exception as e:
+        log.debug("[exec][%s] 블랙리스트 조회 실패 (skip 적용 안 됨): %s", bot_name, e)
+        blacklist = set()
+
     if open_count >= max_positions:
         log.info("[exec][%s] 최대 보유 %d개 도달 — 신규 매수 skip", bot_name, max_positions)
         return
@@ -80,6 +87,9 @@ def execute_buy_for_bot(
     for cand in buy_candidates[:slots_available]:
         code = cand["stock_code"]
         if not code or code in held_codes:
+            continue
+        if code in blacklist:
+            log.debug("[exec][%s] %s 블랙리스트 skip", bot_name, code)
             continue
 
         price = float(cand["price"])
@@ -123,6 +133,15 @@ def execute_buy_for_bot(
             log.info("[exec][%s] %s 주문 ok=%s id=%s", bot_name, code,
                      result.filled, result.order_id)
             if not result.filled:
+                # 매매불가/주문처리 실패 응답은 일괄 블랙리스트 등록 (정확한 msg 파싱 대신 filled=False 기준)
+                raw = result.raw or {}
+                raw_msg = str(raw.get("msg1") or raw.get("msg") or "주문 실패")
+                try:
+                    client.block_stock(code, account_type, raw_msg[:200], hours=24)
+                    log.info("[exec][%s] %s 블랙리스트 등록: %s",
+                             bot_name, code, raw_msg[:100])
+                except Exception as ex:
+                    log.warning("[exec][%s] %s 블랙리스트 등록 실패: %s", bot_name, code, ex)
                 continue
         except Exception as e:
             log.warning("[exec][%s] %s 주문 실패: %s", bot_name, code, e)

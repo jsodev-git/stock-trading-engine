@@ -68,15 +68,25 @@ def sync_balances(client: BackendClient) -> None:
         except Exception as e:
             log.warning("[sync_balances][%s] 스냅샷 전송 실패: %s", bot_name, e)
 
-        # 포지션 최신 시세 일괄 갱신 (Position.lastPrice + peakPrice)
+        # 브로커 잔고를 진실로 간주해 Position 테이블 재동기화 (drift 제거)
         try:
-            price_entries = [
-                {"stockCode": p.stock_code, "currentPrice": p.current_price}
-                for p in balance.positions if p.current_price > 0
+            reconcile_payload = [
+                {
+                    "stockCode": p.stock_code,
+                    "stockName": p.stock_name,
+                    "quantity": p.quantity,
+                    "avgPrice": p.avg_price,
+                    "currentPrice": p.current_price,
+                }
+                for p in balance.positions if p.quantity > 0
             ]
-            client.update_position_prices(bot_id, price_entries)
+            stats = client.reconcile_positions(bot_id, reconcile_payload)
+            if stats.get("created") or stats.get("deleted"):
+                log.info("[sync_balances][%s] 포지션 동기화: +%d / 갱신 %d / -%d",
+                         bot_name, stats.get("created", 0),
+                         stats.get("updated", 0), stats.get("deleted", 0))
         except Exception as e:
-            log.warning("[sync_balances][%s] 포지션 가격 갱신 실패: %s", bot_name, e)
+            log.warning("[sync_balances][%s] 포지션 동기화 실패: %s", bot_name, e)
         finally:
             try:
                 broker.disconnect()

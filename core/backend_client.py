@@ -114,6 +114,28 @@ class BackendClient:
         resp = self._session.post(url, json={"botId": bot_id, "prices": prices}, timeout=10)
         resp.raise_for_status()
 
+    def reconcile_positions(self, bot_id: int, positions: list[dict[str, Any]]) -> dict[str, int]:
+        """브로커 잔고를 진실로 간주해 DB Position을 재동기화."""
+        url = f"{self.base_url}/api/internal/positions/reconcile"
+        resp = self._session.post(url, json={"botId": bot_id, "positions": positions}, timeout=10)
+        resp.raise_for_status()
+        return resp.json().get("data", {})
+
+    def get_blacklist(self, account_type: str) -> list[str]:
+        """해당 계좌 타입의 활성 매매불가 종목코드 리스트."""
+        url = f"{self.base_url}/api/internal/blacklist"
+        resp = self._session.get(url, params={"accountType": account_type}, timeout=10)
+        resp.raise_for_status()
+        return resp.json().get("data", [])
+
+    def block_stock(self, stock_code: str, account_type: str, reason: str, hours: int = 24) -> None:
+        url = f"{self.base_url}/api/internal/blacklist"
+        resp = self._session.post(url, json={
+            "stockCode": stock_code, "accountType": account_type,
+            "reason": reason, "hours": hours,
+        }, timeout=10)
+        resp.raise_for_status()
+
     def record_signal(self, bot_id: int, signal: dict[str, Any]) -> None:
         """매매 시그널 저장."""
         payload = {
