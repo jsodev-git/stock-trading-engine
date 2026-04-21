@@ -106,6 +106,13 @@ class BackendClient:
         resp = self._session.post(url, json=payload, timeout=10)
         resp.raise_for_status()
 
+    def get_positions(self, bot_id: int) -> list[dict[str, Any]]:
+        """봇의 보유 포지션 목록."""
+        url = f"{self.base_url}/api/internal/positions"
+        resp = self._session.get(url, params={"botId": bot_id}, timeout=10)
+        resp.raise_for_status()
+        return resp.json().get("data", [])
+
     def update_position_prices(self, bot_id: int, prices: list[dict[str, Any]]) -> None:
         """prices: [{"stockCode": "005930", "currentPrice": 73000}, ...]"""
         if not prices:

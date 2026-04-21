@@ -32,9 +32,19 @@ from typing import Any
 
 _PROFILE_PARAMS = {
     # (hard_stop, trailing_gap, hold_hours, close_before_market_end)
-    "AGGRESSIVE":   (0.05, 0.030, 6, False),
-    "MODERATE":     (0.04, 0.020, 4, False),
-    "CONSERVATIVE": (0.03, 0.015, 2, True),
+    # 트레일링 갭 조정 — 너무 넓어서 수익 피크 대비 많이 꺾인 뒤에야 팔리던 문제.
+    # AGGRESSIVE 3% → 2%, MODERATE 2% → 1.5% 로 좁혀 수익 보존.
+    "AGGRESSIVE":   (0.05, 0.020, 6, False),
+    "MODERATE":     (0.04, 0.015, 4, False),
+    "CONSERVATIVE": (0.03, 0.012, 2, True),
+}
+
+# 투자성향별 "절대 익절" — 이 이상 오르면 수급/모멘텀 불문 즉시 매도 (이익 확정).
+# HOLD 편향으로 큰 수익 놓치는 것 방지.
+_HARD_TAKE_PROFIT = {
+    "AGGRESSIVE":   0.15,   # +15% 이상이면 무조건 매도
+    "MODERATE":     0.12,
+    "CONSERVATIVE": 0.08,
 }
 
 _MARKET_CLOSE_KST = time(15, 30)
@@ -86,11 +96,19 @@ def decide_exit(
     # AUTO 모드
     params = _PROFILE_PARAMS.get(investment_type.upper(), _PROFILE_PARAMS["MODERATE"])
     hard_stop, trailing_gap, hold_hours, close_before_end = params
+    hard_take_profit = _HARD_TAKE_PROFIT.get(investment_type.upper(), 0.12)
 
     # 1) 절대 손절 (circuit breaker)
     if current_profit <= -hard_stop:
         return ExitDecision(
             True, [f"절대 손절 {current_profit*100:.2f}% (한계 {-hard_stop*100:.1f}%)"],
+            "high", current_profit
+        )
+
+    # 1-2) 절대 익절 — 큰 수익은 수급 판단 기다리지 말고 확정
+    if current_profit >= hard_take_profit:
+        return ExitDecision(
+            True, [f"절대 익절 +{current_profit*100:.2f}% (상한 +{hard_take_profit*100:.1f}%)"],
             "high", current_profit
         )
 
@@ -132,10 +150,20 @@ def decide_exit(
             if foreign_net < 0:
                 reasons.append(f"외인 {foreign_net:,}주")
             return ExitDecision(True, reasons, "medium", current_profit)
-        # 모멘텀 강함 → 트레일링 스탑이 다음 사이클에 발동될 것 (HOLD)
+
+        # 익절 도달 후 HOLD 중이라도 좁은 트레일링(기본 갭의 절반) 적용.
+        # 데이터 누락으로 모멘텀 판정이 덜 되는 경우 안전장치.
+        tight_gap = trailing_gap / 2
+        if drawdown >= tight_gap:
+            return ExitDecision(
+                True,
+                [f"익절+좁은 트레일링 — 피크 +{peak_profit*100:.2f}%에서 -{drawdown*100:.2f}% 꺾임"],
+                "high", current_profit,
+            )
+
         return ExitDecision(
             False,
-            [f"익절 +{current_profit*100:.2f}% 도달했으나 모멘텀 강 (트레일링 HOLD)"],
+            [f"익절 +{current_profit*100:.2f}% 도달, 모멘텀 강 (좁은 트레일링 -{tight_gap*100:.1f}% 대기)"],
             "low",
         )
 

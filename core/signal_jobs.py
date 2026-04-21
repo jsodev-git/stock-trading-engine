@@ -100,15 +100,26 @@ def scan_and_signal_kr(client: BackendClient, top_n: int = 30) -> None:
 
         time.sleep(_KIS_CALL_DELAY)  # price_rankers → flow 사이 지연
 
+        # 수급 수집 대상 = hot_codes + 봇 보유 종목 (exit 판정에 필요)
+        held_codes: set[str] = set()
+        for bot in kr_bots:
+            try:
+                positions = client.get_positions(bot["id"])
+                held_codes.update(p.get("stockCode") for p in positions if p.get("stockCode"))
+            except Exception as e:
+                log.debug("[signal_job] 봇 %s 포지션 조회 실패: %s", bot["id"], e)
+        target_codes = list(dict.fromkeys(list(hot_codes) + list(held_codes)))[:15]  # rate limit 고려 15개
+        log.debug("[signal_job] 수급 수집 대상 %d개 (핫 %d + 보유 %d)",
+                  len(target_codes), len(hot_codes), len(held_codes))
+
         flow_by_code: dict[str, dict] = {}
-        for code in hot_codes:
+        for code in target_codes:
             try:
                 flow = broker.get_investor_flow(code)
                 flow_by_code[code] = flow
                 client.record_flow(code, flow)
             except Exception as e:
                 log.warning("[signal_job] 수급 조회 실패 %s: %s", code, e)
-            time.sleep(_KIS_CALL_DELAY)
 
         if not hot_codes:
             log.info("[signal_job] 핫 종목 없음, 시그널 생성 skip")
