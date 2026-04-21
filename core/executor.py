@@ -29,6 +29,27 @@ from core.backend_client import BackendClient
 log = logging.getLogger(__name__)
 
 
+def _is_blacklist_worthy(msg: str) -> bool:
+    """KIS 실패 메시지 중 '이 종목은 매매 자체가 불가' 계열만 블랙리스트 대상.
+
+    등록 O: 매매불가·거래정지·상장폐지·정리매매·관리종목·투자경고 등 종목 자체 문제
+    등록 X: 잔고 부족·rate limit·호가 오류·시간외·네트워크 (일시적·종목 탓 아님)
+    """
+    if not msg:
+        return False
+    negative = ("주문가능금액", "예수금", "잔고", "초당 거래건수",
+                "호가", "시간외", "정상처리", "네트워크", "타임아웃", "token")
+    for p in negative:
+        if p in msg:
+            return False
+    positive = ("매매불가", "거래정지", "거래 정지", "상장폐지", "정리매매",
+                "투자경고", "관리종목", "ETF 해지", "거래소 지정")
+    for p in positive:
+        if p in msg:
+            return True
+    return False  # 알 수 없는 실패는 오탐 방지 위해 등록 안 함
+
+
 def _should_place_orders(account_type: str) -> bool:
     """ENGINE_MODE + 계좌 타입에 따라 실제 주문할지 결정."""
     mode = config.engine_mode.upper()
@@ -126,25 +147,31 @@ def execute_buy_for_bot(
             log.info("[exec][%s] DRY — 실제 주문 skip", bot_name)
             continue
 
-        # 3) 실제 주문 (시장가). KIS 주문 API 초당 제한 회피 위해 지연.
-        time.sleep(_ORDER_DELAY)
+        # 3) 실제 주문 (시장가). KIS 간격은 KISBroker._api_call이 강제.
+        stock_label = f"{cand.get('stock_name') or ''} {code}".strip()
         try:
             result = broker.place_buy(code, qty, price=None)
-            log.info("[exec][%s] %s 주문 ok=%s id=%s", bot_name, code,
-                     result.filled, result.order_id)
+            log.info("[exec][%s] %s 주문 ok=%s id=%s",
+                     bot_name, stock_label, result.filled, result.order_id)
             if not result.filled:
-                # 매매불가/주문처리 실패 응답은 일괄 블랙리스트 등록 (정확한 msg 파싱 대신 filled=False 기준)
                 raw = result.raw or {}
                 raw_msg = str(raw.get("msg1") or raw.get("msg") or "주문 실패")
-                try:
-                    client.block_stock(code, account_type, raw_msg[:200], hours=24)
-                    log.info("[exec][%s] %s 블랙리스트 등록: %s",
-                             bot_name, code, raw_msg[:100])
-                except Exception as ex:
-                    log.warning("[exec][%s] %s 블랙리스트 등록 실패: %s", bot_name, code, ex)
+                # "매매불가/거래정지/상장폐지" 류만 블랙리스트. 잔고/rate limit/호가는 제외.
+                if _is_blacklist_worthy(raw_msg):
+                    try:
+                        # 6시간만 블랙 — 일시적 차단 성격. 만료 후 자동 재시도 → 항구적이면 재등록 루프.
+                        client.block_stock(code, account_type, raw_msg[:200], hours=6)
+                        log.info("[exec][%s] %s 블랙리스트 6h (%s)",
+                                 bot_name, stock_label, raw_msg[:80])
+                    except Exception as ex:
+                        log.warning("[exec][%s] %s 블랙리스트 등록 실패: %s",
+                                    bot_name, stock_label, ex)
+                else:
+                    log.info("[exec][%s] %s 주문 실패(블랙 미등록): %s",
+                             bot_name, stock_label, raw_msg[:80])
                 continue
         except Exception as e:
-            log.warning("[exec][%s] %s 주문 실패: %s", bot_name, code, e)
+            log.warning("[exec][%s] %s 주문 실패: %s", bot_name, stock_label, e)
             continue
 
         # 4) Backend에 포지션 + 매매이력 기록
@@ -232,8 +259,9 @@ def execute_exits_for_bot(
             continue
 
         qty = int(pos["quantity"])
+        stock_label = f"{pos.get('stockName') or ''} {code}".strip()
         log.info("[exit][%s] SELL %s x%d @ %.0f reasons=%s urgency=%s",
-                 bot_name, code, qty, current_price, decision.reasons, decision.urgency)
+                 bot_name, stock_label, qty, current_price, decision.reasons, decision.urgency)
 
         # 시그널 기록 (exit 근거)
         try:
