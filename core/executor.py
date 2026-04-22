@@ -19,9 +19,12 @@ from typing import Any
 
 # KIS 초당 rate limit 대응
 _ORDER_DELAY = 1.0
-# 주문 후 체결가 조회까지 대기 시간 — 시장가는 즉시 체결되지만 조회 반영까지 여유 필요
-_FILL_LOOKUP_DELAY = 1.5
-_FILL_LOOKUP_RETRY = 2
+# 주문 후 체결가 조회까지 대기 시간 — 시장가는 즉시 체결되지만 조회 반영까지 여유 필요.
+# 3회 시도(총 ~9s)로 여유있게 대기 — 조회 지연으로 폴백되는 비율을 최소화.
+_FILL_LOOKUP_DELAYS = (1.5, 2.5, 4.0)
+# 중복 매매 방지 TTL — 직전 체결 직후 다음 exit/buy 사이클이 KIS 잔고 반영 전에
+# 동일 종목을 다시 건드리는 것을 막는다.
+_RECENT_TRADE_TTL = 120.0  # seconds
 
 from ai.exit_signal import decide_exit
 from ai.fee import buy_cost, is_profitable_target, net_pnl, sell_proceeds
@@ -30,6 +33,23 @@ from config import config
 from core.backend_client import BackendClient
 
 log = logging.getLogger(__name__)
+
+# (bot_id, stock_code, action) → 체결 시각. 모듈 레벨에 저장해 사이클 간 공유.
+_RECENT_TRADES: dict[tuple[int, str, str], float] = {}
+
+
+def _mark_recent_trade(bot_id: int, code: str, action: str) -> None:
+    _RECENT_TRADES[(bot_id, code, action)] = time.time()
+    # 오래된 엔트리 청소 (메모리 누수 방지)
+    cutoff = time.time() - _RECENT_TRADE_TTL * 2
+    for key, ts in list(_RECENT_TRADES.items()):
+        if ts < cutoff:
+            _RECENT_TRADES.pop(key, None)
+
+
+def _traded_recently(bot_id: int, code: str, action: str) -> bool:
+    ts = _RECENT_TRADES.get((bot_id, code, action))
+    return bool(ts and (time.time() - ts) < _RECENT_TRADE_TTL)
 
 
 def _is_blacklist_worthy(msg: str) -> bool:
@@ -55,7 +75,7 @@ def _is_blacklist_worthy(msg: str) -> bool:
 
 def _fetch_fill(broker: BaseBroker, order_id: str, stock_code: str,
                 requested_qty: int, requested_price: float) -> OrderFill | None:
-    """주문 직후 체결 평균가 조회. 시장가 주문 체결 반영 지연을 고려해 짧게 재시도.
+    """주문 직후 체결 평균가 조회. 시장가 주문 체결 반영 지연을 고려해 여러 번 재시도.
 
     안전장치: 부분 체결 행만 먼저 응답되는 KIS 지연 케이스에서 잘못된 수량으로
     기록이 덮이는 것을 막기 위해 (1) 요청 수량과 정확히 일치, (2) 체결가가
@@ -66,8 +86,8 @@ def _fetch_fill(broker: BaseBroker, order_id: str, stock_code: str,
     price_floor = requested_price * 0.9 if requested_price > 0 else 0
     price_ceil = requested_price * 1.1 if requested_price > 0 else float("inf")
     last_fill: OrderFill | None = None
-    for attempt in range(_FILL_LOOKUP_RETRY):
-        time.sleep(_FILL_LOOKUP_DELAY if attempt == 0 else _FILL_LOOKUP_DELAY * 2)
+    for attempt, delay in enumerate(_FILL_LOOKUP_DELAYS):
+        time.sleep(delay)
         try:
             fill = broker.get_order_fill(order_id, stock_code)
         except Exception as e:
@@ -150,6 +170,10 @@ def execute_buy_for_bot(
             continue
         if code in blacklist:
             log.debug("[exec][%s] %s 블랙리스트 skip", bot_name, code)
+            continue
+        # 직전 사이클에서 같은 종목 매매한 경우 — KIS 잔고 반영 지연으로 중복될 수 있으므로 skip
+        if _traded_recently(bot_id, code, "BUY") or _traded_recently(bot_id, code, "SELL"):
+            log.info("[exec][%s] %s 최근 체결 TTL 내 — 중복 방지 skip", bot_name, code)
             continue
 
         price = float(cand["price"])
@@ -252,6 +276,7 @@ def execute_buy_for_bot(
                 "reason": "SIGNAL",
                 "signalReasons": str(cand.get("reasons", [])),
             })
+            _mark_recent_trade(bot_id, code, "BUY")
         except Exception as e:
             log.warning("[exec][%s] %s 기록 실패 (주문은 나감): %s", bot_name, code, e)
 
@@ -285,6 +310,11 @@ def execute_exits_for_bot(
 
     for pos in positions:
         code = pos["stockCode"]
+
+        # 직전 사이클에서 이미 매도한 종목 — KIS 잔고 반영 지연으로 잔재해도 재매도 금지
+        if _traded_recently(bot_id, code, "SELL"):
+            log.info("[exit][%s] %s 최근 매도 TTL 내 — 중복 방지 skip", bot_name, code)
+            continue
 
         # 현재가 조회 (가벼운 호출)
         try:
@@ -393,6 +423,7 @@ def execute_exits_for_bot(
                 "reason": _classify_exit_reason(decision.reasons),
                 "signalReasons": str(decision.reasons),
             })
+            _mark_recent_trade(bot_id, code, "SELL")
         except Exception as e:
             log.warning("[exit][%s] %s 기록 실패: %s", bot_name, code, e)
 
