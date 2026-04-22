@@ -53,10 +53,19 @@ def _is_blacklist_worthy(msg: str) -> bool:
     return False  # 알 수 없는 실패는 오탐 방지 위해 등록 안 함
 
 
-def _fetch_fill(broker: BaseBroker, order_id: str, stock_code: str) -> OrderFill | None:
-    """주문 직후 체결 평균가 조회. 시장가 주문 체결 반영 지연을 고려해 짧게 재시도."""
+def _fetch_fill(broker: BaseBroker, order_id: str, stock_code: str,
+                requested_qty: int, requested_price: float) -> OrderFill | None:
+    """주문 직후 체결 평균가 조회. 시장가 주문 체결 반영 지연을 고려해 짧게 재시도.
+
+    안전장치: 부분 체결 행만 먼저 응답되는 KIS 지연 케이스에서 잘못된 수량으로
+    기록이 덮이는 것을 막기 위해 (1) 요청 수량과 정확히 일치, (2) 체결가가
+    요청가 대비 비정상(±10% 초과) 이탈이 아닐 때만 신뢰한다. 그 외엔 폴백.
+    """
     if not order_id:
         return None
+    price_floor = requested_price * 0.9 if requested_price > 0 else 0
+    price_ceil = requested_price * 1.1 if requested_price > 0 else float("inf")
+    last_fill: OrderFill | None = None
     for attempt in range(_FILL_LOOKUP_RETRY):
         time.sleep(_FILL_LOOKUP_DELAY if attempt == 0 else _FILL_LOOKUP_DELAY * 2)
         try:
@@ -64,8 +73,19 @@ def _fetch_fill(broker: BaseBroker, order_id: str, stock_code: str) -> OrderFill
         except Exception as e:
             log.debug("체결 조회 실패 (%s, attempt %d): %s", order_id, attempt + 1, e)
             fill = None
-        if fill and fill.filled_quantity > 0 and fill.avg_fill_price > 0:
+        if not fill or fill.filled_quantity <= 0 or fill.avg_fill_price <= 0:
+            continue
+        last_fill = fill
+        # 수량이 일치하고 가격이 정상 범위일 때만 채택
+        if fill.filled_quantity == requested_qty and price_floor <= fill.avg_fill_price <= price_ceil:
             return fill
+        log.debug("체결 조회 불완전 (%s): qty=%d/%d price=%.0f (요청 %.0f) → 재시도",
+                  order_id, fill.filled_quantity, requested_qty,
+                  fill.avg_fill_price, requested_price)
+    if last_fill is not None:
+        log.warning("체결 조회 불완전 → 폴백 (%s qty=%d/%d price=%.0f 요청=%.0f)",
+                    order_id, last_fill.filled_quantity, requested_qty,
+                    last_fill.avg_fill_price, requested_price)
     return None
 
 
@@ -195,7 +215,7 @@ def execute_buy_for_bot(
 
         # 4) 실제 체결 평균가 조회 → 요청가와 다르면 체결가로 보정.
         # 수수료는 체결금액 × 수수료율로 재계산 (MOCK=0%, REAL=0.015%)
-        fill = _fetch_fill(broker, result.order_id, code)
+        fill = _fetch_fill(broker, result.order_id, code, qty, price)
         if fill:
             actual_price = fill.avg_fill_price
             actual_qty = fill.filled_quantity
@@ -332,7 +352,7 @@ def execute_exits_for_bot(
             continue
 
         # 체결 평균가 조회 → 순손익 계산은 체결가 기준
-        fill = _fetch_fill(broker, sell_result.order_id, code)
+        fill = _fetch_fill(broker, sell_result.order_id, code, qty, current_price)
         if fill:
             actual_price = fill.avg_fill_price
             actual_qty = fill.filled_quantity
