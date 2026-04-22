@@ -19,10 +19,13 @@ from typing import Any
 
 # KIS 초당 rate limit 대응
 _ORDER_DELAY = 1.0
+# 주문 후 체결가 조회까지 대기 시간 — 시장가는 즉시 체결되지만 조회 반영까지 여유 필요
+_FILL_LOOKUP_DELAY = 1.5
+_FILL_LOOKUP_RETRY = 2
 
 from ai.exit_signal import decide_exit
 from ai.fee import buy_cost, is_profitable_target, net_pnl, sell_proceeds
-from broker.base import BaseBroker, OrderSide
+from broker.base import BaseBroker, OrderFill, OrderSide
 from config import config
 from core.backend_client import BackendClient
 
@@ -48,6 +51,22 @@ def _is_blacklist_worthy(msg: str) -> bool:
         if p in msg:
             return True
     return False  # 알 수 없는 실패는 오탐 방지 위해 등록 안 함
+
+
+def _fetch_fill(broker: BaseBroker, order_id: str, stock_code: str) -> OrderFill | None:
+    """주문 직후 체결 평균가 조회. 시장가 주문 체결 반영 지연을 고려해 짧게 재시도."""
+    if not order_id:
+        return None
+    for attempt in range(_FILL_LOOKUP_RETRY):
+        time.sleep(_FILL_LOOKUP_DELAY if attempt == 0 else _FILL_LOOKUP_DELAY * 2)
+        try:
+            fill = broker.get_order_fill(order_id, stock_code)
+        except Exception as e:
+            log.debug("체결 조회 실패 (%s, attempt %d): %s", order_id, attempt + 1, e)
+            fill = None
+        if fill and fill.filled_quantity > 0 and fill.avg_fill_price > 0:
+            return fill
+    return None
 
 
 def _should_place_orders(account_type: str) -> bool:
@@ -174,19 +193,42 @@ def execute_buy_for_bot(
             log.warning("[exec][%s] %s 주문 실패: %s", bot_name, stock_label, e)
             continue
 
-        # 4) Backend에 포지션 + 매매이력 기록
+        # 4) 실제 체결 평균가 조회 → 요청가와 다르면 체결가로 보정.
+        # 수수료는 체결금액 × 수수료율로 재계산 (MOCK=0%, REAL=0.015%)
+        fill = _fetch_fill(broker, result.order_id, code)
+        if fill:
+            actual_price = fill.avg_fill_price
+            actual_qty = fill.filled_quantity
+            actual_amount = fill.total_fill_amount
+            _, actual_fee = buy_cost(actual_price, actual_qty, account_type, "KOSPI")
+            actual_cost = actual_amount + actual_fee
+            log.info("[exec][%s] %s 체결 확인 요청가=%.0f → 체결가=%.0f x %d "
+                     "체결액=%.0f 수수료(%s)=%.0f 총비용=%.0f",
+                     bot_name, stock_label, price, actual_price, actual_qty,
+                     actual_amount, account_type, actual_fee, actual_cost)
+        else:
+            actual_price = price
+            actual_qty = qty
+            actual_amount = price * qty
+            actual_fee = fee
+            actual_cost = total_cost
+            log.info("[exec][%s] %s 체결가 조회 실패 → 요청가 %.0f 기록 "
+                     "수수료(%s)=%.0f 총비용=%.0f",
+                     bot_name, stock_label, price, account_type, actual_fee, actual_cost)
+
+        # 5) Backend에 포지션 + 매매이력 기록 (체결가 기준)
         try:
             client.upsert_position(bot_id, code, cand.get("stock_name"),
-                                    qty, price, total_cost)
+                                    actual_qty, actual_price, actual_cost)
             client.record_trade({
                 "botId": bot_id,
                 "ticker": code,
                 "stockName": cand.get("stock_name"),
                 "action": "BUY",
-                "price": price,
-                "volume": qty,
-                "amount": price * qty,
-                "fee": fee,
+                "price": actual_price,
+                "volume": actual_qty,
+                "amount": actual_amount,
+                "fee": actual_fee,
                 "reason": "SIGNAL",
                 "signalReasons": str(cand.get("reasons", [])),
             })
@@ -194,7 +236,7 @@ def execute_buy_for_bot(
             log.warning("[exec][%s] %s 기록 실패 (주문은 나감): %s", bot_name, code, e)
 
         # 예산 차감 (연속 매수 방지 차원)
-        cash_available -= total_cost
+        cash_available -= actual_cost
 
 
 def execute_exits_for_bot(
@@ -284,35 +326,53 @@ def execute_exits_for_bot(
         # 실제 매도 (시장가). rate limit 회피.
         time.sleep(_ORDER_DELAY)
         try:
-            broker.place_sell(code, qty, price=None)
+            sell_result = broker.place_sell(code, qty, price=None)
         except Exception as e:
             log.warning("[exit][%s] %s 매도 실패: %s", bot_name, code, e)
             continue
 
-        # 순손익 계산
-        initial_cost = float(pos.get("totalCost") or (avg_price * qty))
-        net_receive, sell_fee = sell_proceeds(current_price, qty, account_type, "KOSPI")
+        # 체결 평균가 조회 → 순손익 계산은 체결가 기준
+        fill = _fetch_fill(broker, sell_result.order_id, code)
+        if fill:
+            actual_price = fill.avg_fill_price
+            actual_qty = fill.filled_quantity
+        else:
+            actual_price = current_price
+            actual_qty = qty
+
+        # 순손익 = 체결 수취(수수료+거래세 차감) - 원가(매수 수수료 포함)
+        initial_cost = float(pos.get("totalCost") or (avg_price * actual_qty))
+        net_receive, sell_fee = sell_proceeds(actual_price, actual_qty, account_type, "KOSPI")
         net_gain = net_receive - initial_cost
         profit_rate = net_gain / initial_cost if initial_cost > 0 else 0.0
 
+        if fill:
+            log.info("[exit][%s] %s 체결 확인 요청가=%.0f → 체결가=%.0f x %d "
+                     "수취=%.0f 수수료+세(%s)=%.0f net=%.0f (%.2f%%)",
+                     bot_name, stock_label, current_price, actual_price, actual_qty,
+                     net_receive, account_type, sell_fee, net_gain, profit_rate * 100)
+        else:
+            log.info("[exit][%s] %s 체결가 조회 실패 → 현재가 %.0f 기록 "
+                     "수수료+세(%s)=%.0f net=%.0f (%.2f%%)",
+                     bot_name, stock_label, current_price, account_type, sell_fee,
+                     net_gain, profit_rate * 100)
+
         try:
-            client.reduce_position(bot_id, code, qty)
+            client.reduce_position(bot_id, code, actual_qty)
             client.record_trade({
                 "botId": bot_id,
                 "ticker": code,
                 "stockName": pos.get("stockName"),
                 "action": "SELL",
-                "price": current_price,
-                "volume": qty,
-                "amount": current_price * qty,
+                "price": actual_price,
+                "volume": actual_qty,
+                "amount": actual_price * actual_qty,
                 "fee": sell_fee,
                 "profitRate": profit_rate,
                 "profitAmount": net_gain,
                 "reason": _classify_exit_reason(decision.reasons),
                 "signalReasons": str(decision.reasons),
             })
-            log.info("[exit][%s] %s 체결 net=%.0f 원 (%.2f%%)",
-                     bot_name, code, net_gain, profit_rate * 100)
         except Exception as e:
             log.warning("[exit][%s] %s 기록 실패: %s", bot_name, code, e)
 

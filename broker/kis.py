@@ -29,6 +29,7 @@ from .base import (
     Balance,
     BrokerName,
     Market,
+    OrderFill,
     OrderResult,
     OrderSide,
     Position,
@@ -459,6 +460,75 @@ class KISBroker(BaseBroker):
         # TODO: inquire-psbl-rvsecncl 호출 후 uapi/domestic-stock/v1/trading/order-rvsecncl
         log.warning("KIS cancel_order 미구현 (order_id=%s)", order_id)
         return False
+
+    def get_order_fill(self, order_id: str, stock_code: str) -> OrderFill | None:
+        """주식일별주문체결조회(inquire-daily-ccld)로 실제 체결 평균가 확정.
+
+        order_id 포맷: "{KRX_FWDG_ORD_ORGNO}-{ODNO}" (place_order에서 조합).
+        여기서 ODNO만 뽑아 매칭한다.
+        """
+        self._ensure_connected()
+        if not order_id:
+            return None
+        odno = order_id.split("-")[-1].strip()
+        if not odno:
+            return None
+
+        tr_id = "VTTC0081R" if self.is_mock else "TTTC8001R"
+        today = time.strftime("%Y%m%d")
+        url = f"{self.base_url}/uapi/domestic-stock/v1/trading/inquire-daily-ccld"
+        params = {
+            "CANO": self._cano,
+            "ACNT_PRDT_CD": self._acnt_prdt_cd,
+            "INQR_STRT_DT": today,
+            "INQR_END_DT": today,
+            "SLL_BUY_DVSN_CD": "00",
+            "INQR_DVSN": "00",
+            "PDNO": stock_code or "",
+            "CCLD_DVSN": "01",        # 체결된 것만
+            "ORD_GNO_BRNO": "",
+            "ODNO": odno,
+            "INQR_DVSN_3": "00",
+            "INQR_DVSN_1": "",
+            "CTX_AREA_FK100": "",
+            "CTX_AREA_NK100": "",
+        }
+        try:
+            resp = self._api_call('GET', url, headers=self._auth_headers(tr_id), params=params)
+        except Exception as e:
+            log.debug("[KIS] get_order_fill 호출 실패 (%s): %s", order_id, e)
+            return None
+
+        if resp.status_code != 200:
+            log.debug("[KIS] get_order_fill status=%s body=%s",
+                      resp.status_code, resp.text[:120])
+            return None
+
+        data = resp.json()
+        if data.get("rt_cd") != "0":
+            log.debug("[KIS] get_order_fill rt_cd=%s msg=%s",
+                      data.get("rt_cd"), data.get("msg1"))
+            return None
+
+        rows = data.get("output1") or []
+        # ODNO가 정확히 일치하는 행만
+        matched = [r for r in rows if str(r.get("odno", "")).strip() == odno]
+        if not matched:
+            return None
+
+        total_qty = sum(_to_int_safe(r.get("tot_ccld_qty")) for r in matched)
+        total_amt = sum(_to_int_safe(r.get("tot_ccld_amt")) for r in matched)
+        if total_qty <= 0 or total_amt <= 0:
+            return None
+        avg_price = total_amt / total_qty
+
+        return OrderFill(
+            order_id=order_id,
+            stock_code=stock_code,
+            filled_quantity=total_qty,
+            avg_fill_price=avg_price,
+            total_fill_amount=float(total_amt),
+        )
 
     # ─── helpers ───
 

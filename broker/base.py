@@ -45,6 +45,17 @@ class OrderResult:
 
 
 @dataclass
+class OrderFill:
+    """주문의 실제 체결 결과. 시장가 주문은 요청가와 체결가가 다르므로
+    사후에 조회해 체결 평균가·금액을 확정한다."""
+    order_id: str
+    stock_code: str
+    filled_quantity: int
+    avg_fill_price: float      # 평균 체결가 (체결금액/수량)
+    total_fill_amount: float   # 실제 체결금액 (수수료·세 제외)
+
+
+@dataclass
 class Position:
     stock_code: str
     stock_name: str
@@ -111,3 +122,10 @@ class BaseBroker(ABC):
 
     @abstractmethod
     def cancel_order(self, order_id: str) -> bool: ...
+
+    def get_order_fill(self, order_id: str, stock_code: str) -> OrderFill | None:
+        """주문의 실제 체결 정보를 조회. 미구현 브로커는 None 반환.
+
+        시장가 체결가 vs 요청가 괴리로 인한 집계 오차를 없애기 위해 사용.
+        """
+        return None
