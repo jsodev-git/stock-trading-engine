@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import logging
 import time
+import uuid
 from datetime import datetime
 from typing import Any
 
@@ -212,6 +213,8 @@ def execute_buy_for_bot(
             continue
 
         # 3) 실제 주문 (시장가). KIS 간격은 KISBroker._api_call이 강제.
+        # client_order_id — 주문 직전 UUID 생성. record_trade가 멱등성 보장.
+        client_order_id = f"BUY-{bot_id}-{code}-{uuid.uuid4().hex[:16]}"
         stock_label = f"{cand.get('stock_name') or ''} {code}".strip()
         try:
             result = broker.place_buy(code, qty, price=None)
@@ -276,6 +279,8 @@ def execute_buy_for_bot(
                 "fee": actual_fee,
                 "reason": "SIGNAL",
                 "signalReasons": str(cand.get("reasons", [])),
+                "orderUuid": result.order_id,
+                "clientOrderId": client_order_id,
             })
             _mark_recent_trade(bot_id, code, "BUY")
         except Exception as e:
@@ -300,24 +305,36 @@ def execute_exits_for_bot(
     stop_loss_rate = bot.get("stopLossRate")
     take_profit_rate = bot.get("takeProfitRate")
 
+    # 진실원: KIS 잔고. DB Position은 stale될 수 있으므로 매도 후보 판단엔 쓰지 않는다.
+    # DB는 peak_price·entry_at·total_cost 등 메타데이터 병합에만 사용.
     try:
-        positions = _get_bot_positions(client, bot_id)
+        balance = broker.get_balance()
     except Exception as e:
-        log.warning("[exit][%s] 포지션 조회 실패: %s", bot_name, e)
+        log.warning("[exit][%s] KIS 잔고 조회 실패: %s", bot_name, e)
+        return
+    kis_positions = [p for p in balance.positions if p.quantity > 0]
+    if not kis_positions:
         return
 
-    if not positions:
-        return
+    # 메타데이터용 DB 포지션 매핑
+    try:
+        db_positions = _get_bot_positions(client, bot_id)
+    except Exception as e:
+        log.debug("[exit][%s] DB 포지션 조회 실패 (메타 없이 진행): %s", bot_name, e)
+        db_positions = []
+    db_by_code: dict[str, dict] = {p["stockCode"]: p for p in db_positions}
 
-    for pos in positions:
-        code = pos["stockCode"]
+    for kis_pos in kis_positions:
+        code = kis_pos.stock_code
+        qty = int(kis_pos.quantity)
+        avg_price = float(kis_pos.avg_price)
 
-        # 직전 사이클에서 이미 매도한 종목 — KIS 잔고 반영 지연으로 잔재해도 재매도 금지
+        # 직전 사이클에서 이미 매도 시도한 종목 — KIS eventual consistency 대응
         if _traded_recently(bot_id, code, "SELL"):
-            log.info("[exit][%s] %s 최근 매도 TTL 내 — 중복 방지 skip", bot_name, code)
+            log.info("[exit][%s] %s 최근 매도 TTL 내 — skip", bot_name, code)
             continue
 
-        # 현재가 조회 (가벼운 호출)
+        # 현재가 조회
         try:
             current_price = broker.get_current_price(code)
         except Exception as e:
@@ -326,15 +343,18 @@ def execute_exits_for_bot(
         if current_price <= 0:
             continue
 
-        avg_price = float(pos["avgPrice"])
-        peak_price = max(float(pos["peakPrice"]), current_price)
+        # DB 메타데이터 병합 — 없으면 합리적 기본값
+        db_meta = db_by_code.get(code) or {}
+        peak_price = max(float(db_meta.get("peakPrice") or avg_price), current_price)
+        entry_at = _parse_dt(db_meta.get("entryAt")) if db_meta.get("entryAt") else datetime.now()
+        stock_name = kis_pos.stock_name or db_meta.get("stockName")
+        initial_cost = float(db_meta.get("totalCost") or (avg_price * qty))
 
         flow = flow_by_code.get(code) or {}
-        entry_at = _parse_dt(pos.get("entryAt"))
 
         decision = decide_exit(
             avg_price=avg_price,
-            quantity=int(pos["quantity"]),
+            quantity=qty,
             peak_price=peak_price,
             entry_at=entry_at,
             current_price=current_price,
@@ -351,8 +371,7 @@ def execute_exits_for_bot(
                       ((current_price - avg_price) / avg_price) * 100)
             continue
 
-        qty = int(pos["quantity"])
-        stock_label = f"{pos.get('stockName') or ''} {code}".strip()
+        stock_label = f"{stock_name or ''} {code}".strip()
         log.info("[exit][%s] SELL %s x%d @ %.0f reasons=%s urgency=%s",
                  bot_name, stock_label, qty, current_price, decision.reasons, decision.urgency)
 
@@ -360,7 +379,7 @@ def execute_exits_for_bot(
         try:
             client.record_signal(bot_id, {
                 "stockCode": code,
-                "stockName": pos.get("stockName"),
+                "stockName": stock_name,
                 "action": "SELL",
                 "strength": 0.9 if decision.urgency == "high" else 0.6,
                 "reasons": decision.reasons,
@@ -375,6 +394,8 @@ def execute_exits_for_bot(
             continue
 
         # 실제 매도 (시장가). rate limit 회피.
+        # client_order_id — 멱등성 키. record_trade 중복 기록 방지.
+        client_order_id = f"SELL-{bot_id}-{code}-{uuid.uuid4().hex[:16]}"
         time.sleep(_ORDER_DELAY)
         try:
             sell_result = broker.place_sell(code, qty, price=None)
@@ -403,7 +424,7 @@ def execute_exits_for_bot(
             actual_qty = qty
 
         # 순손익 = 체결 수취(수수료+거래세 차감) - 원가(매수 수수료 포함)
-        initial_cost = float(pos.get("totalCost") or (avg_price * actual_qty))
+        # initial_cost는 exit 루프 진입 시 DB 메타에서 가져왔음 (없으면 avg_price * qty)
         net_receive, sell_fee = sell_proceeds(actual_price, actual_qty, account_type, "KOSPI")
         net_gain = net_receive - initial_cost
         profit_rate = net_gain / initial_cost if initial_cost > 0 else 0.0
@@ -424,7 +445,7 @@ def execute_exits_for_bot(
             client.record_trade({
                 "botId": bot_id,
                 "ticker": code,
-                "stockName": pos.get("stockName"),
+                "stockName": stock_name,
                 "action": "SELL",
                 "price": actual_price,
                 "volume": actual_qty,
@@ -434,6 +455,8 @@ def execute_exits_for_bot(
                 "profitAmount": net_gain,
                 "reason": _classify_exit_reason(decision.reasons),
                 "signalReasons": str(decision.reasons),
+                "orderUuid": sell_result.order_id,
+                "clientOrderId": client_order_id,
             })
             _mark_recent_trade(bot_id, code, "SELL")
         except Exception as e:
