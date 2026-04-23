@@ -131,6 +131,10 @@ class BaseBroker(ABC):
         """
         return max(0.0, self.get_balance().cash)
 
+    def get_daily_closes(self, stock_code: str, days: int = 30) -> list[float]:
+        """최근 days일 종가 (오래된 → 최신 순). 미구현 브로커는 빈 리스트."""
+        return []
+
     def get_order_fill(self, order_id: str, stock_code: str) -> OrderFill | None:
         """주문의 실제 체결 정보를 조회. 미구현 브로커는 None 반환.
 

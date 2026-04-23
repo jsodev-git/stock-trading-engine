@@ -299,6 +299,40 @@ class KISBroker(BaseBroker):
         data = resp.json().get("output") or {}
         return float(data.get("stck_prpr") or 0)
 
+    def get_daily_closes(self, stock_code: str, days: int = 30) -> list[float]:
+        """최근 days일 종가 리스트 (오래된 → 최신 순). 기술 지표(SMA·RSI) 계산용.
+
+        TR FHKST01010400: 주식현재가 일자별 조회 (일·주·월·년). 실/모의 공용.
+        최대 30일 정도 반환. 실패 시 빈 리스트.
+        """
+        self._ensure_connected()
+        url = f"{self.base_url}/uapi/domestic-stock/v1/quotations/inquire-daily-price"
+        params = {
+            "FID_COND_MRKT_DIV_CODE": "J",
+            "FID_INPUT_ISCD": stock_code,
+            "FID_PERIOD_DIV_CODE": "D",  # D=일, W=주, M=월
+            "FID_ORG_ADJ_PRC": "0",       # 수정주가 반영
+        }
+        try:
+            resp = self._api_call('GET', url, headers=self._auth_headers("FHKST01010400"), params=params)
+        except Exception as e:
+            log.debug("[KIS] get_daily_closes 호출 실패 %s: %s", stock_code, e)
+            return []
+        if resp.status_code != 200:
+            return []
+        data = resp.json()
+        if data.get("rt_cd") != "0":
+            return []
+        rows = data.get("output") or []
+        # 최신 → 오래된 순으로 오므로 뒤집어서 반환
+        closes: list[float] = []
+        for r in rows[:days]:
+            v = _to_int_safe(r.get("stck_clpr"))
+            if v > 0:
+                closes.append(float(v))
+        closes.reverse()
+        return closes
+
     # ─── 시장 스크리닝 (KRX) ───
 
     def get_volume_rankers(self, top_n: int = 30) -> list[dict[str, Any]]:

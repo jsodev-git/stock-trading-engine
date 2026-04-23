@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import logging
 import time
+from datetime import datetime, time as dtime
 from typing import Any
 
 from ai.signal import score_buy_candidate
@@ -25,12 +26,58 @@ _KIS_CALL_DELAY = 1.0
 
 log = logging.getLogger(__name__)
 
-# 투자성향별 BUY 임계값
+# 투자성향별 BUY 임계값 (수익률 개선을 위해 상향 — 이전 AGG 0.35는 승률 26.5%로 저조)
 _BUY_THRESHOLD = {
-    "AGGRESSIVE": 0.35,
-    "MODERATE": 0.50,
-    "CONSERVATIVE": 0.65,
+    "AGGRESSIVE": 0.55,
+    "MODERATE": 0.65,
+    "CONSERVATIVE": 0.75,
 }
+
+# 장 초반·마감 직전 30분 임계값 가산치 — 변동성·거짓 신호 구간
+_VOLATILE_WINDOW_BUMP = 0.15
+
+
+def _is_volatile_window(now: datetime | None = None) -> bool:
+    """장 초반 09:00-09:30 또는 마감 직전 15:00-15:30 여부."""
+    t = (now or datetime.now()).time()
+    return (dtime(9, 0) <= t < dtime(9, 30)) or (dtime(15, 0) <= t < dtime(15, 30))
+
+
+def _compute_rsi(closes: list[float], period: int = 14) -> float | None:
+    """Wilder's RSI. 데이터 부족 시 None."""
+    if len(closes) < period + 1:
+        return None
+    gains: list[float] = []
+    losses: list[float] = []
+    for i in range(1, len(closes)):
+        diff = closes[i] - closes[i - 1]
+        gains.append(max(0.0, diff))
+        losses.append(max(0.0, -diff))
+    avg_gain = sum(gains[:period]) / period
+    avg_loss = sum(losses[:period]) / period
+    for i in range(period, len(gains)):
+        avg_gain = (avg_gain * (period - 1) + gains[i]) / period
+        avg_loss = (avg_loss * (period - 1) + losses[i]) / period
+    if avg_loss == 0:
+        return 100.0
+    rs = avg_gain / avg_loss
+    return 100.0 - (100.0 / (1.0 + rs))
+
+
+def _is_overbought(closes: list[float], current_price: float) -> tuple[bool, str]:
+    """과매수 판정 — (1) 5일 SMA 대비 +5% 이상 급등, (2) RSI(14) > 70.
+
+    반환: (filter_out, reason)
+    """
+    if len(closes) < 5:
+        return False, ""
+    sma5 = sum(closes[-5:]) / 5
+    if sma5 > 0 and current_price > sma5 * 1.05:
+        return True, f"5일 SMA({sma5:.0f}) 대비 현재가 +{((current_price / sma5) - 1) * 100:.1f}% 과열"
+    rsi = _compute_rsi(closes)
+    if rsi is not None and rsi > 70:
+        return True, f"RSI {rsi:.1f} 과매수 (>70)"
+    return False, ""
 
 
 def _pick_kr_kis_broker(bots: list[dict]) -> BaseBroker | None:
@@ -125,13 +172,53 @@ def scan_and_signal_kr(client: BackendClient, top_n: int = 30) -> None:
             log.info("[signal_job] 핫 종목 없음, 시그널 생성 skip")
             return
 
+        # 2-1. 핫 종목 과매수 필터 — 5일 SMA · RSI 기반
+        # hot_codes가 이미 등락률 상위라 대부분 과열 지점에 있어 추격매수 위험
+        overbought_codes: set[str] = set()
+        overbought_reason: dict[str, str] = {}
+        for code in hot_codes:
+            try:
+                closes = broker.get_daily_closes(code, days=30)
+                cur = price_by_code.get(code, {}).get("price") or (closes[-1] if closes else 0)
+                if closes and cur:
+                    over, reason = _is_overbought(closes, float(cur))
+                    if over:
+                        overbought_codes.add(code)
+                        overbought_reason[code] = reason
+            except Exception as e:
+                log.debug("[signal_job] %s 과매수 판정 실패(무시): %s", code, e)
+            time.sleep(0.3)  # KIS rate limit
+        if overbought_codes:
+            log.info("[signal_job] 과매수 필터: %d건 제외 (%s)",
+                     len(overbought_codes),
+                     ", ".join(f"{c}:{overbought_reason[c][:40]}" for c in list(overbought_codes)[:3]))
+
         # 3. 봇별 시그널 생성 + 실행
+        volatile_now = _is_volatile_window()
         for bot in kr_bots:
-            threshold = _BUY_THRESHOLD.get(bot.get("investmentType", "MODERATE"), 0.5)
+            base_threshold = _BUY_THRESHOLD.get(bot.get("investmentType", "MODERATE"), 0.65)
+            threshold = base_threshold + (_VOLATILE_WINDOW_BUMP if volatile_now else 0.0)
             bot_id = bot["id"]
+
+            # 당일 손절 종목 재매수 금지 — 6시간 내 매도된 티커
+            try:
+                recent_sold = set(client.get_recent_sold_tickers(bot_id, hours=6))
+            except Exception as e:
+                log.debug("[signal_job][%s] 최근 매도 조회 실패(무시): %s", bot.get("name"), e)
+                recent_sold = set()
+            if recent_sold:
+                log.info("[signal_job][%s] 최근 매도 %d종 재매수 금지: %s",
+                         bot.get("name"), len(recent_sold), sorted(recent_sold))
+
             generated = 0
             buy_candidates: list[dict[str, Any]] = []
             for code in hot_codes:
+                # 과매수 / 최근 매도는 시그널 기록은 하되 BUY 후보에서만 제외
+                blocked_reason = None
+                if code in overbought_codes:
+                    blocked_reason = f"과매수 skip: {overbought_reason.get(code, '')}"
+                elif code in recent_sold:
+                    blocked_reason = "당일 매도 종목 재매수 금지"
                 v = volume_by_code.get(code) or {}
                 p = price_by_code.get(code) or {}
                 f = flow_by_code.get(code) or {
@@ -150,13 +237,16 @@ def scan_and_signal_kr(client: BackendClient, top_n: int = 30) -> None:
                     individual_net=f.get("individual_net_qty", 0),
                     ranker_size=top_n,
                 )
-                action = "BUY" if signal.strength >= threshold else "HOLD"
+                action = "BUY" if (signal.strength >= threshold and blocked_reason is None) else "HOLD"
+                signal_reasons = list(signal.reasons)
+                if blocked_reason and signal.strength >= threshold:
+                    signal_reasons.append(f"BLOCKED: {blocked_reason}")
                 payload: dict[str, Any] = {
                     "stockCode": signal.stock_code,
                     "stockName": signal.stock_name,
                     "action": action,
                     "strength": signal.strength,
-                    "reasons": signal.reasons,
+                    "reasons": signal_reasons,
                     "price": signal.price,
                     "executed": False,
                 }
@@ -174,11 +264,12 @@ def scan_and_signal_kr(client: BackendClient, top_n: int = 30) -> None:
                         "price": signal.price,
                         "change_rate": p.get("change_rate") or 0,
                         "strength": signal.strength,
-                        "reasons": signal.reasons,
+                        "reasons": signal_reasons,
                     })
 
-            log.info("[signal_job][%s] %d개 시그널 (threshold=%.2f, BUY %d)",
-                     bot.get("name"), generated, threshold, len(buy_candidates))
+            log.info("[signal_job][%s] %d개 시그널 (threshold=%.2f%s, BUY %d)",
+                     bot.get("name"), generated, threshold,
+                     " [변동성구간 +0.15]" if volatile_now else "", len(buy_candidates))
 
             # 실행 — 각 봇마다 자체 브로커 세션
             _execute_for_bot(client, bot, buy_candidates, flow_by_code)

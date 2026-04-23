@@ -143,6 +143,13 @@ class BackendClient:
         }, timeout=10)
         resp.raise_for_status()
 
+    def get_recent_sold_tickers(self, bot_id: int, hours: int = 24) -> list[str]:
+        """봇 기준 hours 이내 매도된 고유 티커 — 재매수 금지용."""
+        url = f"{self.base_url}/api/internal/trades/recent-sold"
+        resp = self._session.get(url, params={"botId": bot_id, "hours": hours}, timeout=10)
+        resp.raise_for_status()
+        return resp.json().get("data", [])
+
     def record_signal(self, bot_id: int, signal: dict[str, Any]) -> None:
         """매매 시그널 저장."""
         payload = {
