@@ -1,22 +1,18 @@
-"""매매 시그널 생성 — 스캔·수급 데이터를 결합한 규칙 기반 1차 구현.
+"""매매 시그널 생성 — 데이터 분석 기반 재설계 (v2).
 
-점수화 규칙 (KRX 기준, 단순 합산 후 0~1 정규화):
-- 거래량 상위 내 랭킹 (높을수록 가산)
-- 등락률 상위 내 랭킹 (높을수록 가산)
-- 등락률 자체 (+3% 이상 가산, 상한)
-- 외인 순매수 양수 (+가산, 로그 스케일)
-- 기관 순매수 양수 (+가산)
-- 개인 순매수 음수 (= 세력이 받아주는 중, 가산 조건부)
+기존(v1)은 "거래량 상위 + 등락률 상위 + 수급" 단순 합산이었고,
+실제 데이터 분석 결과 **시그널 강도와 수익률이 역상관** (0.80+ 고강도 -7.35%).
+원인: "이미 많이 오른 종목"을 추격해 꼭대기 잡는 구조.
 
-투자성향별 threshold (BUY 임계치):
-- AGGRESSIVE: 0.35 (적극 진입)
-- MODERATE: 0.50
-- CONSERVATIVE: 0.65
+재설계 원칙 (축적 데이터 기반):
+- 과열(+10% 이상) 종목은 강제 제외 — 대부분 당일 꺾임
+- 등락률 sweet spot 1~5% 에 가산, 5~10% 는 약한 가산(추격 주의)
+- 5일 SMA 근접도 — 근접할수록 가산, 멀수록 감점 (SMA(5) 대비 +5% 초과 시 감점)
+- 외인+기관 동시 순매도 큰 감점 (실데이터에 없는 조합이어야 함)
+- 거래량·등락률 동시 상위만 가산 (한쪽만은 약한 시그널)
+- 수급 자체 가중치 축소 (실데이터 상관관계 약함)
 
-SELL 시그널은 보유 중인 종목에 대해 다음 조건:
-- 등락률이 stopLossRate 도달
-- 등락률이 takeProfitRate 도달
-- 급격한 외인/기관 순매도
+Threshold: 단일값 0.40 (투자성향별 차이 없음, 성향은 자본배분 tradeRatio로)
 """
 from __future__ import annotations
 
@@ -35,7 +31,6 @@ class Signal:
 
 
 def _log_scale(qty: int, cap: int = 100_000) -> float:
-    """순매수 수량을 0~1 사이 로그 점수로 변환 (cap 이상이면 1.0)."""
     if qty <= 0:
         return 0.0
     return min(1.0, math.log10(qty + 1) / math.log10(cap + 1))
@@ -45,82 +40,102 @@ def score_buy_candidate(
     stock_code: str,
     stock_name: str,
     price: float,
-    change_rate: float,          # 등락률, 0.03 = +3%
-    volume_rank: int | None,     # 거래량 상위 랭킹 (1이 최고), None이면 순위 없음
-    price_rank: int | None,      # 등락률 상위 랭킹
+    change_rate: float,
+    volume_rank: int | None,
+    price_rank: int | None,
     foreign_net: int,
     institution_net: int,
     individual_net: int,
     ranker_size: int = 30,
+    daily_closes: list[float] | None = None,
+    in_hot_theme: bool = False,
 ) -> Signal:
-    """매수 후보 점수화 → Signal.
+    """매수 후보 점수화 — v2 (데이터 분석 반영).
 
-    KRX 가격제한폭이 ±30%라 상한가/하한가 근접 종목은 매수 제외.
-    (상한가: 체결 거의 안 됨 + 추가 상승 여지 없음 / 하한가: 급락 중)
+    hard filter:
+    - ±29% 이상 (상/하한가 근접): 제외
+    - +10% 이상 (당일 급등): 제외 (추격 매수 위험 — 분석상 대부분 꺾임)
     """
+    # ─── Hard filters ───
     if change_rate >= 0.29:
-        return Signal(
-            stock_code=stock_code, stock_name=stock_name,
-            action="HOLD", strength=0.0,
-            reasons=[f"상한가 근접 +{change_rate*100:.2f}% (매수 제외)"],
-            price=price,
-        )
+        return Signal(stock_code, stock_name, "HOLD", 0.0,
+                      [f"상한가 근접 +{change_rate*100:.2f}% skip"], price)
     if change_rate <= -0.29:
-        return Signal(
-            stock_code=stock_code, stock_name=stock_name,
-            action="HOLD", strength=0.0,
-            reasons=[f"하한가 근접 {change_rate*100:.2f}% (매수 제외)"],
-            price=price,
-        )
+        return Signal(stock_code, stock_name, "HOLD", 0.0,
+                      [f"하한가 근접 {change_rate*100:.2f}% skip"], price)
+    if change_rate >= 0.10:
+        return Signal(stock_code, stock_name, "HOLD", 0.0,
+                      [f"과열 +{change_rate*100:.2f}% — 추격 매수 제외"], price)
 
     reasons: list[str] = []
     score = 0.0
 
-    # 1) 거래량 랭킹
-    if volume_rank and volume_rank <= ranker_size:
-        s = (ranker_size - volume_rank + 1) / ranker_size * 0.20
-        score += s
+    # 1) 등락률 sweet spot
+    if 0.01 <= change_rate <= 0.05:
+        score += 0.25
+        reasons.append(f"건강한 상승 +{change_rate*100:.2f}%")
+    elif 0.05 < change_rate < 0.10:
+        score += 0.08
+        reasons.append(f"강한 상승 +{change_rate*100:.2f}% (추격 주의)")
+    elif -0.01 < change_rate < 0.01:
+        score += 0.05
+        reasons.append(f"보합 {change_rate*100:+.2f}%")
+    elif change_rate <= -0.01:
+        score -= 0.10
+        reasons.append(f"하락 {change_rate*100:.2f}%")
+
+    # 2) 5일 SMA 근접도 — 과열/과매수 억제
+    sma5 = None
+    if daily_closes and len(daily_closes) >= 5:
+        sma5 = sum(daily_closes[-5:]) / 5
+        if sma5 > 0:
+            ratio = price / sma5
+            if 0.98 <= ratio <= 1.03:
+                score += 0.20
+                reasons.append(f"SMA5 근접 (+{(ratio-1)*100:.1f}%)")
+            elif 1.03 < ratio <= 1.05:
+                score += 0.05
+                reasons.append(f"SMA5 대비 +{(ratio-1)*100:.1f}%")
+            elif ratio > 1.05:
+                score -= 0.20
+                reasons.append(f"SMA5 대비 +{(ratio-1)*100:.1f}% 과열 감점")
+            elif ratio < 0.97:
+                score -= 0.05
+                reasons.append(f"SMA5 대비 {(ratio-1)*100:.1f}% 이탈")
+
+    # 3) 거래량·등락률 동시 상위만 의미있는 신호
+    if volume_rank and price_rank and volume_rank <= 15 and price_rank <= 15:
+        score += 0.18
+        reasons.append(f"거래·등락 동시 상위 (V{volume_rank}/P{price_rank})")
+    elif volume_rank and volume_rank <= 10:
+        score += 0.05
         reasons.append(f"거래량 {volume_rank}위")
 
-    # 2) 등락률 랭킹
-    if price_rank and price_rank <= ranker_size:
-        s = (ranker_size - price_rank + 1) / ranker_size * 0.20
-        score += s
-        reasons.append(f"등락률 {price_rank}위")
-
-    # 3) 등락률 자체 (상승만, 3% 이상 가산, 10% 이상 포화)
-    if change_rate > 0.03:
-        s = min(0.15, (change_rate - 0.03) * 2)
-        score += s
-        reasons.append(f"등락률 +{change_rate*100:.2f}%")
-    elif change_rate < -0.03:
-        score -= 0.10
-        reasons.append(f"등락률 {change_rate*100:.2f}% (감점)")
-
-    # 4) 외인 순매수 (세력 매집)
+    # 4) 외인 순매수 (약한 긍정)
     if foreign_net > 0:
-        s = _log_scale(foreign_net) * 0.20
-        score += s
+        score += _log_scale(foreign_net) * 0.10
         reasons.append(f"외인 +{foreign_net:,}주")
-    elif foreign_net < -10_000:
-        score -= 0.10
-        reasons.append(f"외인 {foreign_net:,}주 (순매도)")
 
     # 5) 기관 순매수
     if institution_net > 0:
-        s = _log_scale(institution_net) * 0.15
-        score += s
+        score += _log_scale(institution_net) * 0.08
         reasons.append(f"기관 +{institution_net:,}주")
-    elif institution_net < -10_000:
-        score -= 0.05
-        reasons.append(f"기관 {institution_net:,}주 (순매도)")
 
-    # 6) 개인 순매도 = 외인·기관이 받아가는 중 (보너스)
-    if individual_net < 0 and (foreign_net > 0 or institution_net > 0):
-        score += 0.10
-        reasons.append("개인 순매도 (수급 흡수)")
+    # 6) 외인+기관 동시 순매도 큰 감점 (위험 신호)
+    if foreign_net < 0 and institution_net < 0:
+        score -= 0.15
+        reasons.append("외인+기관 동시 순매도")
 
-    # 0 ~ 1 클램프
+    # 7) 개인 과매수 + 세력 매도 — 전형적 분산 덤핑 패턴
+    if individual_net > 50_000 and (foreign_net < 0 or institution_net < 0):
+        score -= 0.10
+        reasons.append("개인 과매수 + 세력 매도 (덤핑 의심)")
+
+    # 8) 당일 강세 테마 멤버 (여러 종목이 동일 흐름) — 테마 랠리 탑승
+    if in_hot_theme:
+        score += 0.18
+        reasons.append("당일 테마 멤버 (동반 상승)")
+
     strength = max(0.0, min(1.0, score))
     action = "BUY" if strength > 0 else "HOLD"
 
@@ -137,35 +152,18 @@ def score_buy_candidate(
 def should_sell_position(
     avg_price: float,
     current_price: float,
-    stop_loss_rate: float,     # 음수 (-0.02)
-    take_profit_rate: float,   # 양수 (+0.08)
+    stop_loss_rate: float,
+    take_profit_rate: float,
 ) -> Signal | None:
-    """보유 포지션에 대한 SELL 조건 평가."""
+    """단순 FIXED 모드용 — AUTO는 exit_signal.decide_exit 사용."""
     if avg_price <= 0:
         return None
     rate = (current_price - avg_price) / avg_price
 
-    reasons: list[str] = []
-    strength = 0.0
-    trigger = False
-
     if rate <= stop_loss_rate:
-        trigger = True
-        strength = 0.9
-        reasons.append(f"손절 도달 {rate*100:.2f}%")
-    elif rate >= take_profit_rate:
-        trigger = True
-        strength = 0.8
-        reasons.append(f"익절 도달 +{rate*100:.2f}%")
-
-    if not trigger:
-        return None
-
-    return Signal(
-        stock_code="",  # 호출자가 채움
-        stock_name="",
-        action="SELL",
-        strength=strength,
-        reasons=reasons,
-        price=current_price,
-    )
+        return Signal("", "", "SELL", 0.9,
+                      [f"손절 도달 {rate*100:.2f}%"], current_price)
+    if rate >= take_profit_rate:
+        return Signal("", "", "SELL", 0.8,
+                      [f"익절 도달 +{rate*100:.2f}%"], current_price)
+    return None

@@ -26,21 +26,66 @@ _KIS_CALL_DELAY = 1.0
 
 log = logging.getLogger(__name__)
 
-# 투자성향별 BUY 임계값 (수익률 개선을 위해 상향 — 이전 AGG 0.35는 승률 26.5%로 저조)
-_BUY_THRESHOLD = {
-    "AGGRESSIVE": 0.55,
-    "MODERATE": 0.65,
-    "CONSERVATIVE": 0.75,
-}
+# 단일 BUY threshold — 분석 결과 시그널 강도와 수익률이 역상관이라 투자성향별 분리 무의미.
+# 성향 차이는 tradeRatio·maxPositions·stop_loss/take_profit로 반영.
+_BUY_THRESHOLD = 0.40
 
-# 장 초반·마감 직전 30분 임계값 가산치 — 변동성·거짓 신호 구간
-_VOLATILE_WINDOW_BUMP = 0.15
+# BUY 허용 시간대 — 분석 결과 10-14시 매수 거의 다 손실(-150만). 09:30-11:00, 14:00-14:30만 허용.
+# (09:00-09:30은 장 초반 변동성 심해 제외, 15시 이후는 마감 임박으로 제외)
+_BUY_WINDOWS = [
+    (dtime(9, 30), dtime(11, 0)),
+    (dtime(14, 0), dtime(14, 30)),
+]
 
 
-def _is_volatile_window(now: datetime | None = None) -> bool:
-    """장 초반 09:00-09:30 또는 마감 직전 15:00-15:30 여부."""
+def _is_buy_window(now: datetime | None = None) -> bool:
+    """매수 허용 시간대."""
     t = (now or datetime.now()).time()
-    return (dtime(9, 0) <= t < dtime(9, 30)) or (dtime(15, 0) <= t < dtime(15, 30))
+    return any(start <= t < end for start, end in _BUY_WINDOWS)
+
+
+def _pearson(a: list[float], b: list[float]) -> float:
+    n = min(len(a), len(b))
+    if n < 3:
+        return 0.0
+    a, b = a[-n:], b[-n:]
+    ma, mb = sum(a) / n, sum(b) / n
+    num = sum((a[i] - ma) * (b[i] - mb) for i in range(n))
+    da = (sum((x - ma) ** 2 for x in a)) ** 0.5
+    db = (sum((x - mb) ** 2 for x in b)) ** 0.5
+    if da == 0 or db == 0:
+        return 0.0
+    return num / (da * db)
+
+
+def _detect_hot_theme(closes_by_code: dict[str, list[float]]) -> set[str]:
+    """당일 강세 테마 멤버 집합 반환.
+
+    각 종목의 최근 5일 일간 수익률을 계산하고, 서로의 평균 상관이 높은 종목들이
+    3개 이상이면 "테마"로 간주. 상관관계로 동반 상승 패턴 탐지.
+    """
+    returns_by: dict[str, list[float]] = {}
+    for code, closes in closes_by_code.items():
+        if len(closes) < 6:
+            continue
+        rets: list[float] = []
+        for i in range(len(closes) - 5, len(closes)):
+            if i > 0 and closes[i - 1] > 0:
+                rets.append((closes[i] - closes[i - 1]) / closes[i - 1])
+        if len(rets) >= 4:
+            returns_by[code] = rets
+    if len(returns_by) < 3:
+        return set()
+
+    codes = list(returns_by)
+    avg_corr: dict[str, float] = {}
+    for c1 in codes:
+        corrs = [_pearson(returns_by[c1], returns_by[c2]) for c2 in codes if c2 != c1]
+        avg_corr[c1] = sum(corrs) / len(corrs) if corrs else 0.0
+
+    # 평균 상관 0.4 이상을 테마 멤버로
+    members = {c for c, v in avg_corr.items() if v >= 0.4}
+    return members if len(members) >= 3 else set()
 
 
 def _compute_rsi(closes: list[float], period: int = 14) -> float | None:
@@ -172,13 +217,15 @@ def scan_and_signal_kr(client: BackendClient, top_n: int = 30) -> None:
             log.info("[signal_job] 핫 종목 없음, 시그널 생성 skip")
             return
 
-        # 2-1. 핫 종목 과매수 필터 — 5일 SMA · RSI 기반
-        # hot_codes가 이미 등락률 상위라 대부분 과열 지점에 있어 추격매수 위험
+        # 2-1. 핫 종목 일봉 수집 — SMA 시그널용 + 테마 감지용 + 과매수 하드 필터용
+        closes_by_code: dict[str, list[float]] = {}
         overbought_codes: set[str] = set()
         overbought_reason: dict[str, str] = {}
         for code in hot_codes:
             try:
                 closes = broker.get_daily_closes(code, days=30)
+                if closes:
+                    closes_by_code[code] = closes
                 cur = price_by_code.get(code, {}).get("price") or (closes[-1] if closes else 0)
                 if closes and cur:
                     over, reason = _is_overbought(closes, float(cur))
@@ -186,18 +233,25 @@ def scan_and_signal_kr(client: BackendClient, top_n: int = 30) -> None:
                         overbought_codes.add(code)
                         overbought_reason[code] = reason
             except Exception as e:
-                log.debug("[signal_job] %s 과매수 판정 실패(무시): %s", code, e)
+                log.debug("[signal_job] %s 일봉 조회 실패(무시): %s", code, e)
             time.sleep(0.3)  # KIS rate limit
         if overbought_codes:
             log.info("[signal_job] 과매수 필터: %d건 제외 (%s)",
                      len(overbought_codes),
                      ", ".join(f"{c}:{overbought_reason[c][:40]}" for c in list(overbought_codes)[:3]))
 
+        # 2-2. 테마 감지 — 5일 수익률 상관관계 높은 종목군
+        theme_members = _detect_hot_theme(closes_by_code)
+        if theme_members:
+            log.info("[signal_job] 오늘 강세 테마 %d종: %s",
+                     len(theme_members), sorted(theme_members))
+
         # 3. 봇별 시그널 생성 + 실행
-        volatile_now = _is_volatile_window()
+        in_buy_window = _is_buy_window()
+        if not in_buy_window:
+            log.info("[signal_job] 매수 허용 시간대 외 (현재 BUY skip, 시그널만 기록)")
         for bot in kr_bots:
-            base_threshold = _BUY_THRESHOLD.get(bot.get("investmentType", "MODERATE"), 0.65)
-            threshold = base_threshold + (_VOLATILE_WINDOW_BUMP if volatile_now else 0.0)
+            threshold = _BUY_THRESHOLD  # 단일값, 성향별 차이 없음
             bot_id = bot["id"]
 
             # 당일 손절 종목 재매수 금지 — 6시간 내 매도된 티커
@@ -213,9 +267,11 @@ def scan_and_signal_kr(client: BackendClient, top_n: int = 30) -> None:
             generated = 0
             buy_candidates: list[dict[str, Any]] = []
             for code in hot_codes:
-                # 과매수 / 최근 매도는 시그널 기록은 하되 BUY 후보에서만 제외
+                # BUY 차단 이유 — 시그널 기록은 하되 BUY 후보에서만 제외
                 blocked_reason = None
-                if code in overbought_codes:
+                if not in_buy_window:
+                    blocked_reason = "매수 허용 시간대 외 (09:30-11:00 / 14:00-14:30만)"
+                elif code in overbought_codes:
                     blocked_reason = f"과매수 skip: {overbought_reason.get(code, '')}"
                 elif code in recent_sold:
                     blocked_reason = "당일 매도 종목 재매수 금지"
@@ -236,6 +292,8 @@ def scan_and_signal_kr(client: BackendClient, top_n: int = 30) -> None:
                     institution_net=f.get("institution_net_qty", 0),
                     individual_net=f.get("individual_net_qty", 0),
                     ranker_size=top_n,
+                    daily_closes=closes_by_code.get(code),
+                    in_hot_theme=(code in theme_members),
                 )
                 action = "BUY" if (signal.strength >= threshold and blocked_reason is None) else "HOLD"
                 signal_reasons = list(signal.reasons)
@@ -267,9 +325,9 @@ def scan_and_signal_kr(client: BackendClient, top_n: int = 30) -> None:
                         "reasons": signal_reasons,
                     })
 
-            log.info("[signal_job][%s] %d개 시그널 (threshold=%.2f%s, BUY %d)",
-                     bot.get("name"), generated, threshold,
-                     " [변동성구간 +0.15]" if volatile_now else "", len(buy_candidates))
+            log.info("[signal_job][%s] %d개 시그널 (threshold=%.2f, BUY %d%s)",
+                     bot.get("name"), generated, threshold, len(buy_candidates),
+                     "" if in_buy_window else " [매수시간 외 전부 HOLD]")
 
             # 실행 — 각 봇마다 자체 브로커 세션
             _execute_for_bot(client, bot, buy_candidates, flow_by_code)
