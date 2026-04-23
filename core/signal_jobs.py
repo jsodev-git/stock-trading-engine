@@ -210,15 +210,20 @@ def _execute_for_bot(client: BackendClient, bot: dict,
         # 1. Exit 먼저 — 새 진입 전 청산부터
         execute_exits_for_bot(client, bot_broker, bot, flow_by_code)
 
-        # 2. 진입 — 가용 현금 확인 후
-        balance = None
+        # 2. 진입 — 실제 주문가능금액 확인 후. Balance.cash는 매도 체결 직후
+        #    locked로 묶여 음수로 떨어질 수 있으므로 KIS 주문가능금액 API 사용.
+        orderable_cash = 0.0
         try:
-            balance = bot_broker.get_balance()
+            orderable_cash = bot_broker.get_orderable_cash()
         except Exception as e:
-            log.warning("[signal_job][%s] 잔고 조회 실패, BUY skip: %s", bot_name, e)
+            log.warning("[signal_job][%s] 주문가능금액 조회 실패, BUY skip: %s", bot_name, e)
 
-        if balance and buy_candidates:
-            execute_buy_for_bot(client, bot_broker, bot, buy_candidates, balance.cash)
+        if orderable_cash > 0 and buy_candidates:
+            log.info("[signal_job][%s] 주문가능금액 %.0f원, BUY 후보 %d건",
+                     bot_name, orderable_cash, len(buy_candidates))
+            execute_buy_for_bot(client, bot_broker, bot, buy_candidates, orderable_cash)
+        elif orderable_cash <= 0:
+            log.info("[signal_job][%s] 주문가능금액 0원, BUY skip", bot_name)
     finally:
         try:
             bot_broker.disconnect()

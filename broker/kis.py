@@ -461,6 +461,48 @@ class KISBroker(BaseBroker):
         log.warning("KIS cancel_order 미구현 (order_id=%s)", order_id)
         return False
 
+    def get_orderable_cash(self) -> float:
+        """주식주문가능금액 조회 (inquire-psbl-order).
+
+        KIS 모의에서 매도 대금이 locked로 묶여 Balance.cash가 음수일 때에도
+        실제 매수 가능액을 정확히 반환한다. `nrcvb_buy_amt` (미수없는매수금액) 사용.
+        """
+        self._ensure_connected()
+        tr_id = "VTTC8908R" if self.is_mock else "TTTC8908R"
+        url = f"{self.base_url}/uapi/domestic-stock/v1/trading/inquire-psbl-order"
+        params = {
+            "CANO": self._cano,
+            "ACNT_PRDT_CD": self._acnt_prdt_cd,
+            "PDNO": "",          # 공백 = 계좌 전체 기준
+            "ORD_UNPR": "0",     # 시장가 기준
+            "ORD_DVSN": "01",    # 시장가
+            "CMA_EVLU_AMT_ICLD_YN": "N",
+            "OVRS_ICLD_YN": "N",
+        }
+        try:
+            resp = self._api_call('GET', url, headers=self._auth_headers(tr_id), params=params)
+        except Exception as e:
+            log.warning("[KIS] get_orderable_cash 호출 실패 → 0 폴백: %s", e)
+            return 0.0
+
+        if resp.status_code != 200:
+            log.warning("[KIS] get_orderable_cash status=%s body=%s",
+                        resp.status_code, resp.text[:120])
+            return 0.0
+
+        data = resp.json()
+        if data.get("rt_cd") != "0":
+            log.warning("[KIS] get_orderable_cash rt_cd=%s msg=%s",
+                        data.get("rt_cd"), data.get("msg1"))
+            return 0.0
+
+        output = data.get("output") or {}
+        # nrcvb_buy_amt: 미수없는매수금액. 없으면 ord_psbl_cash 사용.
+        raw = output.get("nrcvb_buy_amt") or output.get("ord_psbl_cash") or "0"
+        amount = float(_to_int_safe(raw))
+        log.debug("[KIS] 주문가능금액 조회: %.0f원", amount)
+        return amount
+
     def get_order_fill(self, order_id: str, stock_code: str) -> OrderFill | None:
         """주식일별주문체결조회(inquire-daily-ccld)로 실제 체결 평균가 확정.
 

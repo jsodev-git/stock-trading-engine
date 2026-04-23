@@ -123,6 +123,14 @@ class BaseBroker(ABC):
     @abstractmethod
     def cancel_order(self, order_id: str) -> bool: ...
 
+    def get_orderable_cash(self) -> float:
+        """실제 매수 가능한 현금. 미구현 브로커는 Balance.cash를 기본값으로 폴백.
+
+        KIS 모의에서 매도 체결 대금이 locked로 묶여 cash가 음수로 떨어져도
+        실제 매수 가능액은 별도 API(주문가능금액 조회)로 확인해야 정확하다.
+        """
+        return max(0.0, self.get_balance().cash)
+
     def get_order_fill(self, order_id: str, stock_code: str) -> OrderFill | None:
         """주문의 실제 체결 정보를 조회. 미구현 브로커는 None 반환.
 
