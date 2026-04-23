@@ -23,8 +23,9 @@ _ORDER_DELAY = 1.0
 # 3회 시도(총 ~9s)로 여유있게 대기 — 조회 지연으로 폴백되는 비율을 최소화.
 _FILL_LOOKUP_DELAYS = (1.5, 2.5, 4.0)
 # 중복 매매 방지 TTL — 직전 체결 직후 다음 exit/buy 사이클이 KIS 잔고 반영 전에
-# 동일 종목을 다시 건드리는 것을 막는다.
-_RECENT_TRADE_TTL = 120.0  # seconds
+# 동일 종목을 다시 건드리는 것을 막는다. signal_cycle 90s의 최소 6배 이상 잡아
+# 연속 사이클 사이에 확실히 차단되도록.
+_RECENT_TRADE_TTL = 600.0  # seconds (10분)
 
 from ai.exit_signal import decide_exit
 from ai.fee import buy_cost, is_profitable_target, net_pnl, sell_proceeds
@@ -378,7 +379,18 @@ def execute_exits_for_bot(
         try:
             sell_result = broker.place_sell(code, qty, price=None)
         except Exception as e:
-            log.warning("[exit][%s] %s 매도 실패: %s", bot_name, code, e)
+            log.warning("[exit][%s] %s 매도 실패: %s", bot_name, stock_label, e)
+            continue
+
+        # 주문 실패 → 가짜 SELL 레코드 생성 금지. 잔고 없음 류는 재진입 막기 위해 TTL 마킹.
+        if not sell_result.filled:
+            raw = sell_result.raw or {}
+            raw_msg = str(raw.get("msg1") or raw.get("msg") or "주문 실패")
+            log.warning("[exit][%s] %s 매도 주문 실패 — 기록 생성 skip: %s",
+                        bot_name, stock_label, raw_msg[:120])
+            # "잔고 없음" 계열은 다음 사이클 반복 방지 차원에서 긴 TTL로 마킹
+            if "잔고" in raw_msg or "보유" in raw_msg:
+                _mark_recent_trade(bot_id, code, "SELL")
             continue
 
         # 체결 평균가 조회 → 순손익 계산은 체결가 기준
