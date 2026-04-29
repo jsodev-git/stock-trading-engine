@@ -12,14 +12,14 @@ from __future__ import annotations
 
 import logging
 import time
-from datetime import datetime, time as dtime
+from datetime import date
 from typing import Any
 
 from ai.signal import score_buy_candidate
 from broker import get_broker
 from broker.base import BaseBroker
 from core.backend_client import BackendClient
-from core.executor import execute_buy_for_bot, execute_exits_for_bot
+from core.executor import execute_buy_for_bot, execute_exits_for_bot, recover_pending_trades
 
 # KIS는 초당 API 요청 수가 제한돼 있어 각 호출 사이 지연
 _KIS_CALL_DELAY = 1.0
@@ -30,18 +30,26 @@ log = logging.getLogger(__name__)
 # 성향 차이는 tradeRatio·maxPositions·stop_loss/take_profit로 반영.
 _BUY_THRESHOLD = 0.40
 
-# BUY 허용 시간대 — 분석 결과 10-14시 매수 거의 다 손실(-150만). 09:30-11:00, 14:00-14:30만 허용.
-# (09:00-09:30은 장 초반 변동성 심해 제외, 15시 이후는 마감 임박으로 제외)
-_BUY_WINDOWS = [
-    (dtime(9, 30), dtime(11, 0)),
-    (dtime(14, 0), dtime(14, 30)),
-]
+# daily_closes 당일 캐시 — 장중에는 어제까지의 종가만 SMA/RSI에 사용하므로
+# 하루에 한 번만 조회해도 충분. 매 사이클 재조회는 KIS rate limit + sleep으로
+# 사이클 당 ~13s 낭비 (10종 × 1.3s)였음.
+_daily_closes_cache: dict[str, list[float]] = {}
+_daily_closes_cache_date: date | None = None
 
 
-def _is_buy_window(now: datetime | None = None) -> bool:
-    """매수 허용 시간대."""
-    t = (now or datetime.now()).time()
-    return any(start <= t < end for start, end in _BUY_WINDOWS)
+def _get_daily_closes_cached(broker: BaseBroker, code: str, days: int = 30) -> list[float]:
+    """당일 캐시. 날짜 바뀌면 자동 flush (다음 장 열릴 때 새 종가 포함 재조회)."""
+    global _daily_closes_cache_date
+    today = date.today()
+    if _daily_closes_cache_date != today:
+        _daily_closes_cache.clear()
+        _daily_closes_cache_date = today
+    if code in _daily_closes_cache:
+        return _daily_closes_cache[code]
+    closes = broker.get_daily_closes(code, days=days) or []
+    if closes:
+        _daily_closes_cache[code] = closes
+    return closes
 
 
 def _pearson(a: list[float], b: list[float]) -> float:
@@ -110,18 +118,19 @@ def _compute_rsi(closes: list[float], period: int = 14) -> float | None:
 
 
 def _is_overbought(closes: list[float], current_price: float) -> tuple[bool, str]:
-    """과매수 판정 — (1) 5일 SMA 대비 +5% 이상 급등, (2) RSI(14) > 70.
+    """과매수 판정 — 백스탑: SMA5 +8% 초과 OR RSI(14) > 75.
 
-    반환: (filter_out, reason)
+    Why: pool을 등락률 -1~+5%로 좁혔으므로 필터는 안전장치 역할만.
+    실거래에서 급등 추격 손실을 막는 최후 방어선이라 완전 제거는 하지 않음.
     """
     if len(closes) < 5:
         return False, ""
     sma5 = sum(closes[-5:]) / 5
-    if sma5 > 0 and current_price > sma5 * 1.05:
+    if sma5 > 0 and current_price > sma5 * 1.08:
         return True, f"5일 SMA({sma5:.0f}) 대비 현재가 +{((current_price / sma5) - 1) * 100:.1f}% 과열"
     rsi = _compute_rsi(closes)
-    if rsi is not None and rsi > 70:
-        return True, f"RSI {rsi:.1f} 과매수 (>70)"
+    if rsi is not None and rsi > 75:
+        return True, f"RSI {rsi:.1f} 과매수 (>75)"
     return False, ""
 
 
@@ -179,27 +188,43 @@ def scan_and_signal_kr(client: BackendClient, top_n: int = 30) -> None:
             log.warning("[signal_job] 등락률 상위 실패: %s", e)
             price_rows = []
 
-        # 2. 후보 종목 (거래량 ∩ 등락률 교집합 상위 10개) + 수급
+        # 2. 후보 종목 — 모멘텀 초입만: 거래량 상위 중 등락률 -1~+5% 범위
+        # Why: 기존 `거래량 ∩ 등락률 상위`는 +20~30% 급등 종목만 모여 과매수 필터에
+        # 100% 걸리는 구조적 모순. pool 자체를 "건강한 상승" 대역으로 교체.
         volume_by_code: dict[str, dict] = {r["stock_code"]: r for r in volume_rows}
         price_by_code: dict[str, dict] = {r["stock_code"]: r for r in price_rows}
-        hot_codes = list(set(volume_by_code) & set(price_by_code))
 
-        # 등락률 상위 순으로 정렬
-        hot_codes.sort(key=lambda c: price_by_code[c]["rank"])
+        def _cr(code: str) -> float:
+            return float(
+                (volume_by_code.get(code) or {}).get("change_rate")
+                or (price_by_code.get(code) or {}).get("change_rate")
+                or 0
+            )
+
+        # change_rate는 소수 단위(0.03 = 3%). -1~+8% 범위.
+        # 상한 +8%는 SMA5 백스탑(+8%)과 정합. 5~8% 건강 모멘텀 종목이 후보에 진입 가능.
+        hot_codes = [c for c in volume_by_code if -0.01 <= _cr(c) <= 0.08]
+        # 거래량 순위대로 정렬 (등락률 순위 아님 — pool 편향 제거)
+        hot_codes.sort(key=lambda c: volume_by_code[c].get("rank", 9999))
         hot_codes = hot_codes[:10]  # KIS rate limit 고려
 
-        log.info("[signal_job] 핫 종목 %d개 분석", len(hot_codes))
+        log.info("[signal_job] 핫 종목 %d개 분석 (등락률 -1~+8%% 필터)", len(hot_codes))
 
         time.sleep(_KIS_CALL_DELAY)  # price_rankers → flow 사이 지연
 
         # 수급 수집 대상 = hot_codes + 봇 보유 종목 (exit 판정에 필요)
+        # 봇별 held set도 저장 — 봇 루프에서 중복 BUY 시그널 차단에 사용
         held_codes: set[str] = set()
+        held_by_bot: dict[int, set[str]] = {}
         for bot in kr_bots:
             try:
                 positions = client.get_positions(bot["id"])
-                held_codes.update(p.get("stockCode") for p in positions if p.get("stockCode"))
+                codes = {p.get("stockCode") for p in positions if p.get("stockCode")}
+                held_by_bot[bot["id"]] = codes
+                held_codes.update(codes)
             except Exception as e:
                 log.debug("[signal_job] 봇 %s 포지션 조회 실패: %s", bot["id"], e)
+                held_by_bot[bot["id"]] = set()
         target_codes = list(dict.fromkeys(list(hot_codes) + list(held_codes)))[:15]  # rate limit 고려 15개
         log.debug("[signal_job] 수급 수집 대상 %d개 (핫 %d + 보유 %d)",
                   len(target_codes), len(hot_codes), len(held_codes))
@@ -223,7 +248,8 @@ def scan_and_signal_kr(client: BackendClient, top_n: int = 30) -> None:
         overbought_reason: dict[str, str] = {}
         for code in hot_codes:
             try:
-                closes = broker.get_daily_closes(code, days=30)
+                cached = code in _daily_closes_cache
+                closes = _get_daily_closes_cached(broker, code, days=30)
                 if closes:
                     closes_by_code[code] = closes
                 cur = price_by_code.get(code, {}).get("price") or (closes[-1] if closes else 0)
@@ -232,9 +258,10 @@ def scan_and_signal_kr(client: BackendClient, top_n: int = 30) -> None:
                     if over:
                         overbought_codes.add(code)
                         overbought_reason[code] = reason
+                if not cached:
+                    time.sleep(0.3)  # KIS rate limit — 캐시 hit 때는 sleep 불필요
             except Exception as e:
                 log.debug("[signal_job] %s 일봉 조회 실패(무시): %s", code, e)
-            time.sleep(0.3)  # KIS rate limit
         if overbought_codes:
             log.info("[signal_job] 과매수 필터: %d건 제외 (%s)",
                      len(overbought_codes),
@@ -247,16 +274,13 @@ def scan_and_signal_kr(client: BackendClient, top_n: int = 30) -> None:
                      len(theme_members), sorted(theme_members))
 
         # 3. 봇별 시그널 생성 + 실행
-        in_buy_window = _is_buy_window()
-        if not in_buy_window:
-            log.info("[signal_job] 매수 허용 시간대 외 (현재 BUY skip, 시그널만 기록)")
         for bot in kr_bots:
             threshold = _BUY_THRESHOLD  # 단일값, 성향별 차이 없음
             bot_id = bot["id"]
 
-            # 당일 손절 종목 재매수 금지 — 6시간 내 매도된 티커
+            # 당일 손절 종목 재매수 금지 — 2시간 내 매도된 티커 (6h는 너무 보수적)
             try:
-                recent_sold = set(client.get_recent_sold_tickers(bot_id, hours=6))
+                recent_sold = set(client.get_recent_sold_tickers(bot_id, hours=2))
             except Exception as e:
                 log.debug("[signal_job][%s] 최근 매도 조회 실패(무시): %s", bot.get("name"), e)
                 recent_sold = set()
@@ -266,11 +290,12 @@ def scan_and_signal_kr(client: BackendClient, top_n: int = 30) -> None:
 
             generated = 0
             buy_candidates: list[dict[str, Any]] = []
+            bot_held = held_by_bot.get(bot_id, set())
             for code in hot_codes:
                 # BUY 차단 이유 — 시그널 기록은 하되 BUY 후보에서만 제외
                 blocked_reason = None
-                if not in_buy_window:
-                    blocked_reason = "매수 허용 시간대 외 (09:30-11:00 / 14:00-14:30만)"
+                if code in bot_held:
+                    blocked_reason = "이미 보유 중 (중복 매수 방지)"
                 elif code in overbought_codes:
                     blocked_reason = f"과매수 skip: {overbought_reason.get(code, '')}"
                 elif code in recent_sold:
@@ -281,11 +306,12 @@ def scan_and_signal_kr(client: BackendClient, top_n: int = 30) -> None:
                     "foreign_net_qty": 0, "institution_net_qty": 0,
                     "individual_net_qty": 0,
                 }
+                _cr_val = p.get("change_rate") or v.get("change_rate") or 0
                 signal = score_buy_candidate(
                     stock_code=code,
                     stock_name=v.get("stock_name") or p.get("stock_name") or "",
                     price=p.get("price") or v.get("price") or 0,
-                    change_rate=p.get("change_rate") or v.get("change_rate") or 0,
+                    change_rate=_cr_val,
                     volume_rank=v.get("rank"),
                     price_rank=p.get("rank"),
                     foreign_net=f.get("foreign_net_qty", 0),
@@ -299,6 +325,11 @@ def scan_and_signal_kr(client: BackendClient, top_n: int = 30) -> None:
                 signal_reasons = list(signal.reasons)
                 if blocked_reason and signal.strength >= threshold:
                     signal_reasons.append(f"BLOCKED: {blocked_reason}")
+                log.info("[signal_job][%s] %s %s strength=%.2f cr=%+.2f%% %s reasons=%s",
+                         bot.get("name"), action, code,
+                         signal.strength, (_cr_val * 100 if _cr_val else 0.0),
+                         f"BLOCKED({blocked_reason})" if blocked_reason else "",
+                         list(signal.reasons)[:4])
                 payload: dict[str, Any] = {
                     "stockCode": signal.stock_code,
                     "stockName": signal.stock_name,
@@ -325,9 +356,8 @@ def scan_and_signal_kr(client: BackendClient, top_n: int = 30) -> None:
                         "reasons": signal_reasons,
                     })
 
-            log.info("[signal_job][%s] %d개 시그널 (threshold=%.2f, BUY %d%s)",
-                     bot.get("name"), generated, threshold, len(buy_candidates),
-                     "" if in_buy_window else " [매수시간 외 전부 HOLD]")
+            log.info("[signal_job][%s] %d개 시그널 (threshold=%.2f, BUY %d)",
+                     bot.get("name"), generated, threshold, len(buy_candidates))
 
             # 실행 — 각 봇마다 자체 브로커 세션
             _execute_for_bot(client, bot, buy_candidates, flow_by_code)
@@ -356,6 +386,9 @@ def _execute_for_bot(client: BackendClient, bot: dict,
         return
 
     try:
+        # 0. 자동 복구 — 이전 사이클에서 PENDING 잔존 trade 잔고로 재검증
+        recover_pending_trades(client, bot_broker, bot)
+
         # 1. Exit 먼저 — 새 진입 전 청산부터
         execute_exits_for_bot(client, bot_broker, bot, flow_by_code)
 

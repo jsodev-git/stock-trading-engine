@@ -32,9 +32,9 @@ from typing import Any
 
 _PROFILE_PARAMS = {
     # (hard_stop, trailing_gap, hold_hours, close_before_market_end)
-    # 트레일링 갭 조정 — 너무 넓어서 수익 피크 대비 많이 꺾인 뒤에야 팔리던 문제.
-    # AGGRESSIVE 3% → 2%, MODERATE 2% → 1.5% 로 좁혀 수익 보존.
-    "AGGRESSIVE":   (0.05, 0.020, 6, False),
+    # AGGRESSIVE hold 6h→12h: 한국 장 6.5h라 6h은 익일 09시에 거의 항상 시간 만료 트리거.
+    # 12h이면 익일 1.5h 추가 인내 → 추세 회복 기회 확보.
+    "AGGRESSIVE":   (0.05, 0.020, 12, False),
     "MODERATE":     (0.04, 0.015, 4, False),
     "CONSERVATIVE": (0.03, 0.012, 2, True),
 }
@@ -175,9 +175,9 @@ def decide_exit(
             "high", current_profit,
         )
 
-    # 6) 시간 만료
+    # 6) 시간 만료 — 본전 ±0.5% 이내일 때만 발동 (이전 ±1% 기준은 본전 부근 추세 종목 자르던 문제)
     elapsed = now - entry_at
-    if elapsed >= timedelta(hours=hold_hours) and abs(current_profit) < 0.01:
+    if elapsed >= timedelta(hours=hold_hours) and abs(current_profit) < 0.005:
         return ExitDecision(
             True,
             [f"시간 만료 {elapsed.total_seconds()/3600:.1f}h + 변동 거의 없음"],

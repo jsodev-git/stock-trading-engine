@@ -41,6 +41,40 @@ class BackendClient:
         resp.raise_for_status()
         return resp.json().get("data", {})
 
+    def record_pending_trade(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """잔고-차분 흐름 — 주문 직전 PENDING 상태로 INSERT.
+
+        멱등성 키(clientOrderId) 필수. status는 호출 측에서 'PENDING' 강제.
+        UNIQUE 제약 충돌 시 backend가 duplicate=True 반환 (중복 호출 안전).
+        """
+        payload = dict(payload)
+        payload["status"] = "PENDING"
+        return self.record_trade(payload)
+
+    def update_trade_status(self, client_order_id: str, status: str, **fields: Any) -> dict[str, Any]:
+        """PENDING → FILLED/DISCREPANCY/FAILED 전이.
+
+        fields 가능한 키 (모두 optional): orderUuid, actualPrice, actualVolume,
+        actualAmount, actualFee, actualProfitRate, actualProfitAmount.
+        FILLED 전이 시 SELL이고 actualProfitAmount 있으면 backend가 ProfitRecord 누적.
+        """
+        url = f"{self.base_url}/api/internal/trades/by-client-id/{client_order_id}/status"
+        payload: dict[str, Any] = {"status": status}
+        for key in ("orderUuid", "actualPrice", "actualVolume", "actualAmount",
+                    "actualFee", "actualProfitRate", "actualProfitAmount"):
+            if key in fields and fields[key] is not None:
+                payload[key] = fields[key]
+        resp = self._session.patch(url, json=payload, timeout=10)
+        resp.raise_for_status()
+        return resp.json().get("data", {})
+
+    def get_pending_trades(self, bot_id: int) -> list[dict[str, Any]]:
+        """자동 복구용 — 봇의 PENDING 상태 trade 리스트 (오래된 것부터)."""
+        url = f"{self.base_url}/api/internal/trades/pending"
+        resp = self._session.get(url, params={"botId": bot_id}, timeout=10)
+        resp.raise_for_status()
+        return resp.json().get("data", [])
+
     def update_target_stock_codes(self, bot_id: int, stock_codes: list[str]) -> None:
         url = f"{self.base_url}/api/internal/bots/{bot_id}/target-stock-codes"
         resp = self._session.put(url, json=stock_codes, timeout=10)

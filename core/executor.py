@@ -15,7 +15,8 @@ from __future__ import annotations
 import logging
 import time
 import uuid
-from datetime import datetime
+from dataclasses import dataclass
+from datetime import datetime, timedelta
 from typing import Any
 
 # KIS 초당 rate limit 대응
@@ -28,13 +29,78 @@ _FILL_LOOKUP_DELAYS = (1.5, 2.5, 4.0)
 # 연속 사이클 사이에 확실히 차단되도록.
 _RECENT_TRADE_TTL = 600.0  # seconds (10분)
 
+# 잔고-차분 검증 — 주문 직후 KIS 잔고에 반영되기까지 1~3초 지연.
+# retry 1~2회로 eventual consistency 흡수, 여전히 변화 없으면 DISCREPANCY 또는 PENDING 유지.
+_BALANCE_VERIFY_DELAYS = (1.5, 3.0)
+# 자동 복구 임계 — PENDING 상태가 이만큼 경과해도 잔고에 안 반영됐으면 FAILED 마킹.
+# 너무 짧으면 KIS 지연 시 오탐, 너무 길면 다음 사이클 매매와 혼선. 5분이 합리.
+_PENDING_FAIL_THRESHOLD_SEC = 300.0
+
 from ai.exit_signal import decide_exit
 from ai.fee import buy_cost, is_profitable_target, net_pnl, sell_proceeds
-from broker.base import BaseBroker, OrderFill, OrderSide
+from broker.base import BaseBroker, Balance, OrderFill, OrderSide
 from config import config
 from core.backend_client import BackendClient
 
 log = logging.getLogger(__name__)
+
+
+@dataclass
+class BalanceVerification:
+    """잔고-차분 검증 결과.
+
+    - matched=True: 변화량이 expected_delta와 정확히 일치. FILLED 전이 가능.
+    - matched=False, error='no_change': 변화 없음 (주문 미반영 — DISCREPANCY 후보)
+    - matched=False, error='qty_mismatch': 변화는 있는데 수량 다름 (DISCREPANCY)
+    - matched=False, error='lookup_failed': 잔고 조회 자체 실패 (PENDING 유지 → 자동 복구로)
+    """
+    matched: bool
+    actual_delta: int           # 실제 변화량 (BUY는 +, SELL은 -)
+    actual_qty_after: int       # 검증 후 보유 수량
+    actual_avg_price: float     # 검증 후 평균가 (BUY 보정용, SELL은 변화 없음)
+    error: str | None = None
+
+
+def _get_held_qty_from_balance(balance: Balance, stock_code: str) -> tuple[int, float]:
+    """Balance에서 특정 종목의 (수량, 평균가) 추출. 없으면 (0, 0.0)."""
+    for p in balance.positions:
+        if p.stock_code == stock_code:
+            return int(p.quantity), float(p.avg_price)
+    return 0, 0.0
+
+
+def _verify_balance_change(
+    broker: BaseBroker, stock_code: str, prev_qty: int, expected_delta: int,
+) -> BalanceVerification:
+    """주문 후 잔고를 다시 조회해 변화량이 기대값과 일치하는지 검증.
+
+    KIS는 주문 체결과 잔고 반영 사이에 1~3초 지연이 있을 수 있어
+    재시도로 eventual consistency 흡수. 그래도 안 맞으면 호출 측이 PENDING 유지 또는 DISCREPANCY 결정.
+    """
+    last_qty, last_avg = prev_qty, 0.0
+    for delay in _BALANCE_VERIFY_DELAYS:
+        time.sleep(delay)
+        try:
+            balance = broker.get_balance()
+        except Exception as e:
+            log.debug("잔고 검증 조회 실패 %s (delay %.1fs): %s", stock_code, delay, e)
+            continue
+        cur_qty, cur_avg = _get_held_qty_from_balance(balance, stock_code)
+        last_qty, last_avg = cur_qty, cur_avg
+        actual_delta = cur_qty - prev_qty
+        if actual_delta == expected_delta:
+            return BalanceVerification(True, actual_delta, cur_qty, cur_avg)
+        # 변화는 있는데 수량 다른 경우 — 부분체결 가능성. 한 번 더 wait해 본다.
+        if actual_delta != 0 and actual_delta != expected_delta:
+            log.debug("잔고 변화 부분일치 %s: prev=%d cur=%d delta=%d expected=%d (재시도)",
+                      stock_code, prev_qty, cur_qty, actual_delta, expected_delta)
+    # 마지막 측정 결과로 분류
+    final_delta = last_qty - prev_qty
+    if final_delta == expected_delta:
+        return BalanceVerification(True, final_delta, last_qty, last_avg)
+    if final_delta == 0:
+        return BalanceVerification(False, 0, last_qty, last_avg, error="no_change")
+    return BalanceVerification(False, final_delta, last_qty, last_avg, error="qty_mismatch")
 
 # (bot_id, stock_code, action) → 체결 시각. 모듈 레벨에 저장해 사이클 간 공유.
 _RECENT_TRADES: dict[tuple[int, str, str], float] = {}
@@ -212,10 +278,45 @@ def execute_buy_for_bot(
             log.info("[exec][%s] DRY — 실제 주문 skip", bot_name)
             continue
 
-        # 3) 실제 주문 (시장가). KIS 간격은 KISBroker._api_call이 강제.
-        # client_order_id — 주문 직전 UUID 생성. record_trade가 멱등성 보장.
+        # 3) 잔고-차분 흐름:
+        #    (a) 주문 직전 잔고 prev_qty 측정
+        #    (b) PENDING으로 trade INSERT (멱등성 키 = clientOrderId)
+        #    (c) place_buy
+        #    (d) 잔고 재조회로 변화량 검증 (retry 포함)
+        #    (e) 일치=FILLED 보정, 불일치=DISCREPANCY, 조회실패=PENDING 유지(자동 복구)
         client_order_id = f"BUY-{bot_id}-{code}-{uuid.uuid4().hex[:16]}"
         stock_label = f"{cand.get('stock_name') or ''} {code}".strip()
+
+        # (a) prev_qty 측정 — broker.get_balance() 한 번. 실패 시 이번 매수 skip (다음 사이클 재시도).
+        try:
+            prev_balance = broker.get_balance()
+        except Exception as e:
+            log.warning("[exec][%s] %s 사전 잔고 조회 실패 — 매수 skip: %s",
+                        bot_name, stock_label, e)
+            continue
+        prev_qty, _prev_avg = _get_held_qty_from_balance(prev_balance, code)
+
+        # (b) PENDING INSERT — 추정값(요청가·요청수량)으로. 잔고 검증 후 PATCH로 보정.
+        try:
+            client.record_pending_trade({
+                "botId": bot_id,
+                "ticker": code,
+                "stockName": cand.get("stock_name"),
+                "action": "BUY",
+                "price": price,
+                "volume": qty,
+                "amount": price * qty,
+                "fee": fee,
+                "reason": "SIGNAL",
+                "signalReasons": str(cand.get("reasons", [])),
+                "clientOrderId": client_order_id,
+            })
+        except Exception as e:
+            log.warning("[exec][%s] %s PENDING INSERT 실패 — 매수 skip: %s",
+                        bot_name, stock_label, e)
+            continue
+
+        # (c) 실제 주문
         try:
             result = broker.place_buy(code, qty, price=None)
             log.info("[exec][%s] %s 주문 ok=%s id=%s",
@@ -223,10 +324,15 @@ def execute_buy_for_bot(
             if not result.filled:
                 raw = result.raw or {}
                 raw_msg = str(raw.get("msg1") or raw.get("msg") or "주문 실패")
-                # "매매불가/거래정지/상장폐지" 류만 블랙리스트. 잔고/rate limit/호가는 제외.
+                # FAILED 전이 + 필요시 블랙리스트
+                try:
+                    client.update_trade_status(client_order_id, "FAILED",
+                                               orderUuid=result.order_id)
+                except Exception as ex:
+                    log.warning("[exec][%s] %s FAILED 마킹 실패: %s",
+                                bot_name, stock_label, ex)
                 if _is_blacklist_worthy(raw_msg):
                     try:
-                        # 6시간만 블랙 — 일시적 차단 성격. 만료 후 자동 재시도 → 항구적이면 재등록 루프.
                         client.block_stock(code, account_type, raw_msg[:200], hours=6)
                         log.info("[exec][%s] %s 블랙리스트 6h (%s)",
                                  bot_name, stock_label, raw_msg[:80])
@@ -238,56 +344,74 @@ def execute_buy_for_bot(
                              bot_name, stock_label, raw_msg[:80])
                 continue
         except Exception as e:
-            log.warning("[exec][%s] %s 주문 실패: %s", bot_name, stock_label, e)
+            log.warning("[exec][%s] %s 주문 호출 실패 — PENDING 유지 (자동 복구): %s",
+                        bot_name, stock_label, e)
+            # 주문 호출 자체가 raise됐을 때 — 실제로 나갔을 수도, 안 나갔을 수도.
+            # PENDING 유지 → 다음 사이클 자동 복구가 잔고로 진실 판정.
             continue
 
-        # 4) 실제 체결 평균가 조회 → 요청가와 다르면 체결가로 보정.
-        # 수수료는 체결금액 × 수수료율로 재계산 (MOCK=0%, REAL=0.015%)
-        fill = _fetch_fill(broker, result.order_id, code, qty, price)
-        if fill:
-            actual_price = fill.avg_fill_price
-            actual_qty = fill.filled_quantity
-            actual_amount = fill.total_fill_amount
+        # (d) 잔고-차분 검증 (retry 1.5s + 3.0s 총 ~5s)
+        verify = _verify_balance_change(broker, code, prev_qty, expected_delta=qty)
+
+        if verify.matched:
+            # (e1) FILLED — 잔고 변화로 측정한 실제 수량·평균가로 보정
+            actual_qty = verify.actual_delta
+            # 가격: _fetch_fill 보조 (있으면 정확한 체결 평균가) → 없으면 잔고 평균가의 변화
+            #       잔고 평균가는 누적 평균이라 신규 매수분만 정확히 분리는 어려움.
+            #       _fetch_fill이 있으면 그쪽이 더 정확.
+            fill = _fetch_fill(broker, result.order_id, code, qty, price)
+            if fill and fill.filled_quantity == actual_qty:
+                actual_price = fill.avg_fill_price
+                actual_amount = fill.total_fill_amount
+            else:
+                # _fetch_fill 폴백 — 잔고 검증된 평균가의 가중평균으로 신규분 추정
+                # prev_qty=0이면 verify.actual_avg_price가 곧 신규 체결 평균가
+                if prev_qty == 0:
+                    actual_price = verify.actual_avg_price
+                else:
+                    # 누적 평균가에서 신규분 분리 어려움 — 요청가 폴백
+                    actual_price = price
+                actual_amount = actual_price * actual_qty
             _, actual_fee = buy_cost(actual_price, actual_qty, account_type, "KOSPI")
             actual_cost = actual_amount + actual_fee
-            log.info("[exec][%s] %s 체결 확인 요청가=%.0f → 체결가=%.0f x %d "
-                     "체결액=%.0f 수수료(%s)=%.0f 총비용=%.0f",
-                     bot_name, stock_label, price, actual_price, actual_qty,
-                     actual_amount, account_type, actual_fee, actual_cost)
+
+            log.info("[exec][%s] %s FILLED 잔고 +%d (prev=%d) avg=%.0f 비용=%.0f",
+                     bot_name, stock_label, actual_qty, prev_qty, actual_price, actual_cost)
+
+            try:
+                client.upsert_position(bot_id, code, cand.get("stock_name"),
+                                       actual_qty, actual_price, actual_cost)
+                client.update_trade_status(
+                    client_order_id, "FILLED",
+                    orderUuid=result.order_id,
+                    actualPrice=actual_price,
+                    actualVolume=actual_qty,
+                    actualAmount=actual_amount,
+                    actualFee=actual_fee,
+                )
+                _mark_recent_trade(bot_id, code, "BUY")
+            except Exception as e:
+                log.warning("[exec][%s] %s FILLED 기록 실패: %s", bot_name, code, e)
+            cash_available -= actual_cost
+
+        elif verify.error == "no_change":
+            # (e2) DISCREPANCY — 주문 응답은 OK였는데 잔고 변화 없음. 이상 케이스.
+            log.warning("[exec][%s] %s DISCREPANCY 잔고 변화 없음 (prev=%d, expected +%d)",
+                        bot_name, stock_label, prev_qty, qty)
+            try:
+                client.update_trade_status(client_order_id, "DISCREPANCY",
+                                           orderUuid=result.order_id)
+            except Exception as e:
+                log.warning("[exec][%s] %s DISCREPANCY 마킹 실패: %s", bot_name, code, e)
         else:
-            actual_price = price
-            actual_qty = qty
-            actual_amount = price * qty
-            actual_fee = fee
-            actual_cost = total_cost
-            log.info("[exec][%s] %s 체결가 조회 실패 → 요청가 %.0f 기록 "
-                     "수수료(%s)=%.0f 총비용=%.0f",
-                     bot_name, stock_label, price, account_type, actual_fee, actual_cost)
-
-        # 5) Backend에 포지션 + 매매이력 기록 (체결가 기준)
-        try:
-            client.upsert_position(bot_id, code, cand.get("stock_name"),
-                                    actual_qty, actual_price, actual_cost)
-            client.record_trade({
-                "botId": bot_id,
-                "ticker": code,
-                "stockName": cand.get("stock_name"),
-                "action": "BUY",
-                "price": actual_price,
-                "volume": actual_qty,
-                "amount": actual_amount,
-                "fee": actual_fee,
-                "reason": "SIGNAL",
-                "signalReasons": str(cand.get("reasons", [])),
-                "orderUuid": result.order_id,
-                "clientOrderId": client_order_id,
-            })
-            _mark_recent_trade(bot_id, code, "BUY")
-        except Exception as e:
-            log.warning("[exec][%s] %s 기록 실패 (주문은 나감): %s", bot_name, code, e)
-
-        # 예산 차감 (연속 매수 방지 차원)
-        cash_available -= actual_cost
+            # (e3) qty_mismatch 또는 lookup_failed → DISCREPANCY 마킹 + 자동 복구 트리거
+            log.warning("[exec][%s] %s 잔고 검증 불일치 (delta=%d expected=%d error=%s)",
+                        bot_name, stock_label, verify.actual_delta, qty, verify.error)
+            try:
+                client.update_trade_status(client_order_id, "DISCREPANCY",
+                                           orderUuid=result.order_id)
+            except Exception as e:
+                log.warning("[exec][%s] %s DISCREPANCY 마킹 실패: %s", bot_name, code, e)
 
 
 def execute_exits_for_bot(
@@ -315,6 +439,7 @@ def execute_exits_for_bot(
     kis_positions = [p for p in balance.positions if p.quantity > 0]
     if not kis_positions:
         return
+    log.info("[exit][%s] 보유 %d종 exit 판정 시작", bot_name, len(kis_positions))
 
     # 메타데이터용 DB 포지션 매핑
     try:
@@ -367,8 +492,11 @@ def execute_exits_for_bot(
         )
 
         if not decision.should_sell:
-            log.debug("[exit][%s] %s HOLD (%.2f%%)", bot_name, code,
-                      ((current_price - avg_price) / avg_price) * 100)
+            pnl_pct = ((current_price - avg_price) / avg_price) * 100 if avg_price > 0 else 0.0
+            reason = decision.reasons[0] if decision.reasons else "규칙 미트리거"
+            log.info("[exit][%s] HOLD %s %s x%d avg=%.0f cur=%.0f (%+.2f%%) %s",
+                     bot_name, kis_pos.stock_name or "", code, qty,
+                     avg_price, current_price, pnl_pct, reason)
             continue
 
         stock_label = f"{stock_name or ''} {code}".strip()
@@ -393,74 +521,124 @@ def execute_exits_for_bot(
             log.info("[exit][%s] DRY — 실제 매도 skip", bot_name)
             continue
 
-        # 실제 매도 (시장가). rate limit 회피.
-        # client_order_id — 멱등성 키. record_trade 중복 기록 방지.
+        # 잔고-차분 흐름 (BUY와 대칭, expected_delta 음수):
         client_order_id = f"SELL-{bot_id}-{code}-{uuid.uuid4().hex[:16]}"
         time.sleep(_ORDER_DELAY)
+
+        # (a) prev_qty — exit 루프에서 받은 kis_pos 시점이지만, 매도 직전에 다시 측정해 정확도 ↑
         try:
-            sell_result = broker.place_sell(code, qty, price=None)
+            prev_balance = broker.get_balance()
         except Exception as e:
-            log.warning("[exit][%s] %s 매도 실패: %s", bot_name, stock_label, e)
+            log.warning("[exit][%s] %s 사전 잔고 조회 실패 — 매도 skip: %s",
+                        bot_name, stock_label, e)
+            continue
+        prev_qty, prev_avg = _get_held_qty_from_balance(prev_balance, code)
+        if prev_qty < qty:
+            # 보유보다 많이 팔려는 경우 — 데이터 어긋남, 안전 skip
+            log.warning("[exit][%s] %s 보유 부족 (prev_qty=%d < qty=%d) skip",
+                        bot_name, stock_label, prev_qty, qty)
             continue
 
-        # 주문 실패 → 가짜 SELL 레코드 생성 금지. 잔고 없음 류는 재진입 막기 위해 TTL 마킹.
-        if not sell_result.filled:
-            raw = sell_result.raw or {}
-            raw_msg = str(raw.get("msg1") or raw.get("msg") or "주문 실패")
-            log.warning("[exit][%s] %s 매도 주문 실패 — 기록 생성 skip: %s",
-                        bot_name, stock_label, raw_msg[:120])
-            # "잔고 없음" 계열은 다음 사이클 반복 방지 차원에서 긴 TTL로 마킹
-            if "잔고" in raw_msg or "보유" in raw_msg:
-                _mark_recent_trade(bot_id, code, "SELL")
-            continue
-
-        # 체결 평균가 조회 → 순손익 계산은 체결가 기준
-        fill = _fetch_fill(broker, sell_result.order_id, code, qty, current_price)
-        if fill:
-            actual_price = fill.avg_fill_price
-            actual_qty = fill.filled_quantity
-        else:
-            actual_price = current_price
-            actual_qty = qty
-
-        # 순손익 = 체결 수취(수수료+거래세 차감) - 원가(매수 수수료 포함)
-        # initial_cost는 exit 루프 진입 시 DB 메타에서 가져왔음 (없으면 avg_price * qty)
-        net_receive, sell_fee = sell_proceeds(actual_price, actual_qty, account_type, "KOSPI")
-        net_gain = net_receive - initial_cost
-        profit_rate = net_gain / initial_cost if initial_cost > 0 else 0.0
-
-        if fill:
-            log.info("[exit][%s] %s 체결 확인 요청가=%.0f → 체결가=%.0f x %d "
-                     "수취=%.0f 수수료+세(%s)=%.0f net=%.0f (%.2f%%)",
-                     bot_name, stock_label, current_price, actual_price, actual_qty,
-                     net_receive, account_type, sell_fee, net_gain, profit_rate * 100)
-        else:
-            log.info("[exit][%s] %s 체결가 조회 실패 → 현재가 %.0f 기록 "
-                     "수수료+세(%s)=%.0f net=%.0f (%.2f%%)",
-                     bot_name, stock_label, current_price, account_type, sell_fee,
-                     net_gain, profit_rate * 100)
-
+        # (b) PENDING INSERT — 추정값(현재가·요청수량) + reason 분류
+        reason_code = _classify_exit_reason(decision.reasons)
         try:
-            client.reduce_position(bot_id, code, actual_qty)
-            client.record_trade({
+            client.record_pending_trade({
                 "botId": bot_id,
                 "ticker": code,
                 "stockName": stock_name,
                 "action": "SELL",
-                "price": actual_price,
-                "volume": actual_qty,
-                "amount": actual_price * actual_qty,
-                "fee": sell_fee,
-                "profitRate": profit_rate,
-                "profitAmount": net_gain,
-                "reason": _classify_exit_reason(decision.reasons),
+                "price": current_price,
+                "volume": qty,
+                "amount": current_price * qty,
+                "reason": reason_code,
                 "signalReasons": str(decision.reasons),
-                "orderUuid": sell_result.order_id,
                 "clientOrderId": client_order_id,
             })
-            _mark_recent_trade(bot_id, code, "SELL")
         except Exception as e:
-            log.warning("[exit][%s] %s 기록 실패: %s", bot_name, code, e)
+            log.warning("[exit][%s] %s PENDING INSERT 실패 — 매도 skip: %s",
+                        bot_name, stock_label, e)
+            continue
+
+        # (c) 실제 매도
+        try:
+            sell_result = broker.place_sell(code, qty, price=None)
+        except Exception as e:
+            log.warning("[exit][%s] %s 매도 호출 실패 — PENDING 유지 (자동 복구): %s",
+                        bot_name, stock_label, e)
+            continue
+
+        if not sell_result.filled:
+            raw = sell_result.raw or {}
+            raw_msg = str(raw.get("msg1") or raw.get("msg") or "주문 실패")
+            log.warning("[exit][%s] %s 매도 주문 실패 — FAILED 마킹: %s",
+                        bot_name, stock_label, raw_msg[:120])
+            try:
+                client.update_trade_status(client_order_id, "FAILED",
+                                           orderUuid=sell_result.order_id)
+            except Exception as ex:
+                log.warning("[exit][%s] %s FAILED 마킹 실패: %s", bot_name, code, ex)
+            # "잔고 없음" 계열은 다음 사이클 반복 방지 차원에서 긴 TTL 마킹
+            if "잔고" in raw_msg or "보유" in raw_msg:
+                _mark_recent_trade(bot_id, code, "SELL")
+            continue
+
+        # (d) 잔고-차분 검증 — SELL은 expected_delta=-qty
+        verify = _verify_balance_change(broker, code, prev_qty, expected_delta=-qty)
+
+        if verify.matched:
+            actual_qty = -verify.actual_delta  # 음수를 양수로
+            # 체결 평균가는 잔고에서 알기 어려움 (avg_price 변화 없음) → _fetch_fill 보조
+            fill = _fetch_fill(broker, sell_result.order_id, code, qty, current_price)
+            if fill and fill.filled_quantity == actual_qty:
+                actual_price = fill.avg_fill_price
+            else:
+                actual_price = current_price  # 폴백 — 매도 시점 현재가
+
+            # 순손익 = 체결 수취(수수료+세 차감) - 원가(매수 시 누적 비용)
+            # initial_cost는 DB 메타에서 (없으면 avg_price * actual_qty 폴백)
+            # 부분 매도 시 actual_qty < total qty이면 비례 배분
+            cost_per_unit = initial_cost / qty if qty > 0 else avg_price
+            applied_initial_cost = cost_per_unit * actual_qty
+            net_receive, sell_fee = sell_proceeds(actual_price, actual_qty, account_type, "KOSPI")
+            net_gain = net_receive - applied_initial_cost
+            profit_rate = net_gain / applied_initial_cost if applied_initial_cost > 0 else 0.0
+
+            log.info("[exit][%s] %s FILLED 잔고 -%d (prev=%d) 체결가=%.0f net=%.0f (%.2f%%)",
+                     bot_name, stock_label, actual_qty, prev_qty, actual_price,
+                     net_gain, profit_rate * 100)
+
+            try:
+                client.reduce_position(bot_id, code, actual_qty)
+                client.update_trade_status(
+                    client_order_id, "FILLED",
+                    orderUuid=sell_result.order_id,
+                    actualPrice=actual_price,
+                    actualVolume=actual_qty,
+                    actualAmount=actual_price * actual_qty,
+                    actualFee=sell_fee,
+                    actualProfitRate=profit_rate,
+                    actualProfitAmount=net_gain,
+                )
+                _mark_recent_trade(bot_id, code, "SELL")
+            except Exception as e:
+                log.warning("[exit][%s] %s FILLED 기록 실패: %s", bot_name, code, e)
+
+        elif verify.error == "no_change":
+            log.warning("[exit][%s] %s DISCREPANCY 잔고 변화 없음 (매도 미체결?)",
+                        bot_name, stock_label)
+            try:
+                client.update_trade_status(client_order_id, "DISCREPANCY",
+                                           orderUuid=sell_result.order_id)
+            except Exception as e:
+                log.warning("[exit][%s] %s DISCREPANCY 마킹 실패: %s", bot_name, code, e)
+        else:
+            log.warning("[exit][%s] %s 잔고 검증 불일치 (delta=%d expected=%d error=%s)",
+                        bot_name, stock_label, verify.actual_delta, -qty, verify.error)
+            try:
+                client.update_trade_status(client_order_id, "DISCREPANCY",
+                                           orderUuid=sell_result.order_id)
+            except Exception as e:
+                log.warning("[exit][%s] %s DISCREPANCY 마킹 실패: %s", bot_name, code, e)
 
 
 # ─── helpers ───
@@ -509,3 +687,92 @@ def _classify_exit_reason(reasons: list[str]) -> str:
     if "익절" in joined:
         return "TAKE_PROFIT"
     return "SIGNAL"
+
+
+def recover_pending_trades(client: BackendClient, broker: BaseBroker, bot: dict) -> None:
+    """signal_cycle 시작 시 호출 — PENDING 상태로 잔존하는 trade를 잔고 차분으로 재검증.
+
+    시나리오:
+    - 엔진 크래시·네트워크 끊김으로 BUY/SELL 직후 status update 누락된 trade
+    - 주문 호출은 raise됐지만 실제로는 KIS에 도달했을 가능성
+    - eventual consistency로 첫 검증 시 잔고 미반영 → PENDING 유지된 trade
+
+    동작:
+    1. GET /api/internal/trades/pending 으로 봇의 PENDING 리스트 조회
+    2. 각 PENDING마다 broker.get_balance()로 현재 보유량 측정
+    3. executed_at 후 변화량을 보며 BUY/SELL 의도와 비교
+    4. 5분 이상 경과해도 잔고에 안 반영됐으면 FAILED로 마킹
+
+    한계: 같은 종목에 대해 여러 PENDING이 있으면 추적 어려움 → 가장 오래된 것 우선,
+    매도 후 매수 등 순서 의존 케이스는 DISCREPANCY 마킹.
+    """
+    bot_id = bot["id"]
+    bot_name = bot.get("name", str(bot_id))
+    try:
+        pending = client.get_pending_trades(bot_id)
+    except Exception as e:
+        log.debug("[recover][%s] PENDING 조회 실패: %s", bot_name, e)
+        return
+    if not pending:
+        return
+
+    log.info("[recover][%s] PENDING %d건 재검증", bot_name, len(pending))
+
+    try:
+        balance = broker.get_balance()
+    except Exception as e:
+        log.warning("[recover][%s] 잔고 조회 실패 — 다음 사이클로: %s", bot_name, e)
+        return
+
+    now = datetime.now()
+    for trade in pending:
+        try:
+            cid = trade.get("clientOrderId")
+            if not cid:
+                continue
+            ticker = trade.get("ticker")
+            action = trade.get("action")
+            req_qty = int(trade.get("volume") or 0)
+            executed_at_str = trade.get("executedAt")
+            executed_at = _parse_dt(executed_at_str) if executed_at_str else now
+            elapsed = (now - executed_at).total_seconds()
+
+            cur_qty, cur_avg = _get_held_qty_from_balance(balance, ticker)
+
+            # PENDING 시점 잔고를 모르므로 "어떤 변화가 있어야 했는지"는 정확히 모른다.
+            # 하지만 경과 시간이 충분하고(5분+) 잔고에 의도된 결과가 반영됐는지 정도는 판정 가능.
+            #   BUY: cur_qty >= req_qty이면 일단 체결됐다고 간주
+            #   SELL: cur_qty == 0이거나 줄어든 흔적이 있으면 체결됐다고 간주
+            # 단순화 — 정확한 진실원이 부족할 때는 보수적으로 PENDING 유지
+            if elapsed < _PENDING_FAIL_THRESHOLD_SEC:
+                # 너무 빠른 재검증 — 다음 사이클로 미룸
+                continue
+
+            # 5분 경과 — 결정 시점
+            if action == "BUY":
+                # 체결 흔적: 잔고에 보유 있음
+                if cur_qty > 0:
+                    # 정확한 신규분 분리 어려워 PATCH 시 actualVolume·Price는 보정 안 함
+                    # 자동 복구는 status 전이만 (체결가 정확도는 포기)
+                    log.info("[recover][%s] BUY %s %s FILLED (잔고 %d, 경과 %.0fs)",
+                             bot_name, trade.get("stockName") or "", ticker, cur_qty, elapsed)
+                    client.update_trade_status(cid, "FILLED")
+                else:
+                    log.warning("[recover][%s] BUY %s %s FAILED (잔고 0, 경과 %.0fs)",
+                                bot_name, trade.get("stockName") or "", ticker, elapsed)
+                    client.update_trade_status(cid, "FAILED")
+            elif action == "SELL":
+                # 체결 흔적: 보유 줄어들었거나 0. PENDING 시점 보유량을 모르니 "줄어든 게 맞는지"는 모름.
+                # 보수적으로 cur_qty == 0이면 FILLED, 그렇지 않으면 PENDING 유지 (요청 수량만큼 못 줄었을 수도).
+                if cur_qty == 0:
+                    log.info("[recover][%s] SELL %s %s FILLED (잔고 0, 경과 %.0fs)",
+                             bot_name, trade.get("stockName") or "", ticker, elapsed)
+                    client.update_trade_status(cid, "FILLED")
+                else:
+                    # 보유 남아있음 — 부분체결 또는 미체결. DISCREPANCY로 사람 점검 유도.
+                    log.warning("[recover][%s] SELL %s %s DISCREPANCY (잔고 %d, 요청 %d, 경과 %.0fs)",
+                                bot_name, trade.get("stockName") or "", ticker, cur_qty, req_qty, elapsed)
+                    client.update_trade_status(cid, "DISCREPANCY")
+        except Exception as e:
+            log.warning("[recover][%s] %s 처리 실패: %s",
+                        bot_name, trade.get("ticker"), e)
