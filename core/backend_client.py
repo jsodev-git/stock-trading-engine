@@ -184,6 +184,13 @@ class BackendClient:
         resp.raise_for_status()
         return resp.json().get("data", [])
 
+    def get_ticker_pnl(self, bot_id: int, days: int = 30) -> dict[str, float]:
+        """봇별 최근 N일 종목별 누적 net_pnl. 학습 루프 — 저성과 감점용 (2026-05-06)."""
+        url = f"{self.base_url}/api/internal/trades/ticker-pnl"
+        resp = self._session.get(url, params={"botId": bot_id, "days": days}, timeout=10)
+        resp.raise_for_status()
+        return resp.json().get("data", {}) or {}
+
     def record_signal(self, bot_id: int, signal: dict[str, Any]) -> None:
         """매매 시그널 저장."""
         payload = {

@@ -134,6 +134,34 @@ def _is_overbought(closes: list[float], current_price: float) -> tuple[bool, str
     return False, ""
 
 
+# 2026-05-06: ETF/인버스/레버리지 종목 식별. 종목명 패턴 기반.
+# 데이터 검증: ETF 그룹 18건 매매 net -136k vs 일반 12건 +89k.
+# 모멘텀 시그널(거래량+등락률+수급)은 인버스/레버리지 ETF 특성과 부적합.
+_ETF_NAME_PATTERNS = (
+    "KODEX", "TIGER", "ARIRANG", "HANARO", "KBSTAR", "KOSEF",
+    "ACE", "PLUS", "RISE", "SOL", "WOORI",
+    # 동일 종류라도 키워드만으로 잡힘 (예: "삼성 인버스 2X WTI원유 ETN")
+    "인버스", "레버리지", "선물", "ETN",
+)
+
+
+def _is_etf(scan_row: dict) -> bool:
+    """종목명 키워드로 ETF/ETN/인버스/레버리지 식별.
+
+    KIS rank 응답의 stock_name 또는 ticker 첫 글자(Q는 ETN)로 판정.
+    완벽하진 않지만 거래량 상위에 자주 잡히는 종목들은 모두 잡힘.
+    """
+    name = (scan_row.get("stock_name") or "").upper()
+    code = scan_row.get("stock_code") or ""
+    # ticker가 알파벳으로 시작하면 ETN (예: Q530036)
+    if code and not code[0].isdigit():
+        return True
+    for pattern in _ETF_NAME_PATTERNS:
+        if pattern.upper() in name:
+            return True
+    return False
+
+
 def _pick_kr_kis_broker(bots: list[dict]) -> BaseBroker | None:
     for bot in bots:
         if bot.get("market") != "KR" or bot.get("broker") != "KIS":
@@ -203,12 +231,18 @@ def scan_and_signal_kr(client: BackendClient, top_n: int = 30) -> None:
 
         # change_rate는 소수 단위(0.03 = 3%). -1~+8% 범위.
         # 상한 +8%는 SMA5 백스탑(+8%)과 정합. 5~8% 건강 모멘텀 종목이 후보에 진입 가능.
-        hot_codes = [c for c in volume_by_code if -0.01 <= _cr(c) <= 0.08]
+        # 2026-05-06: ETF/인버스/레버리지 종목 hard exclude.
+        # 데이터 분석(4/27~5/4) 결과 ETF 그룹 net -136k vs 일반 +89k. 모멘텀 시그널과
+        # 인버스 ETF는 본질적 부적합 (시장 약세에 인버스 상승 → 우리 시그널 매수 → 시장 회복 시 손실).
+        hot_codes = [
+            c for c in volume_by_code
+            if -0.01 <= _cr(c) <= 0.08 and not _is_etf(volume_by_code[c])
+        ]
         # 거래량 순위대로 정렬 (등락률 순위 아님 — pool 편향 제거)
         hot_codes.sort(key=lambda c: volume_by_code[c].get("rank", 9999))
         hot_codes = hot_codes[:10]  # KIS rate limit 고려
 
-        log.info("[signal_job] 핫 종목 %d개 분석 (등락률 -1~+8%% 필터)", len(hot_codes))
+        log.info("[signal_job] 핫 종목 %d개 분석 (등락률 -1~+8%% 필터, ETF 제외)", len(hot_codes))
 
         time.sleep(_KIS_CALL_DELAY)  # price_rankers → flow 사이 지연
 
@@ -288,6 +322,21 @@ def scan_and_signal_kr(client: BackendClient, top_n: int = 30) -> None:
                 log.info("[signal_job][%s] 최근 매도 %d종 재매수 금지: %s",
                          bot.get("name"), len(recent_sold), sorted(recent_sold))
 
+            # 학습 루프 (2026-05-06) — 직전 30일 종목별 누적 net_pnl 조회.
+            # 시그널 score_buy_candidate에 historical_pnl 전달해 저성과 감점.
+            try:
+                ticker_pnl = client.get_ticker_pnl(bot_id, days=30)
+            except Exception as e:
+                log.debug("[signal_job][%s] ticker_pnl 조회 실패(무시): %s", bot.get("name"), e)
+                ticker_pnl = {}
+            if ticker_pnl:
+                neg = {t: v for t, v in ticker_pnl.items() if v < 0}
+                if neg:
+                    log.info("[signal_job][%s] 누적 손실 종목 %d종 감점 적용: %s",
+                             bot.get("name"), len(neg),
+                             ", ".join(f"{t}({int(v):+,})" for t, v in
+                                       sorted(neg.items(), key=lambda x: x[1])[:5]))
+
             generated = 0
             buy_candidates: list[dict[str, Any]] = []
             bot_held = held_by_bot.get(bot_id, set())
@@ -320,6 +369,7 @@ def scan_and_signal_kr(client: BackendClient, top_n: int = 30) -> None:
                     ranker_size=top_n,
                     daily_closes=closes_by_code.get(code),
                     in_hot_theme=(code in theme_members),
+                    historical_pnl=ticker_pnl.get(code),
                 )
                 action = "BUY" if (signal.strength >= threshold and blocked_reason is None) else "HOLD"
                 signal_reasons = list(signal.reasons)

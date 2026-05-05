@@ -49,6 +49,7 @@ def score_buy_candidate(
     ranker_size: int = 30,
     daily_closes: list[float] | None = None,
     in_hot_theme: bool = False,
+    historical_pnl: float | None = None,  # 2026-05-06: 직전 30일 net_pnl (학습 루프)
 ) -> Signal:
     """매수 후보 점수화 — v2 (데이터 분석 반영).
 
@@ -135,6 +136,21 @@ def score_buy_candidate(
     if in_hot_theme:
         score += 0.18
         reasons.append("당일 테마 멤버 (동반 상승)")
+
+    # 9) 학습 루프 (2026-05-06) — 직전 30일 동일 종목 net_pnl 기반 동적 감점.
+    # 데이터 분석: 005880·049080·049480·114800 등 반복 손실 종목에 시그널이 자꾸 BUY 신호 발산.
+    # 같은 종목 누적 손실이면 strength 깎아 같은 패턴 재발 차단.
+    if historical_pnl is not None:
+        if historical_pnl <= -50_000:
+            score -= 0.20
+            reasons.append(f"직전 30일 누적 -{abs(historical_pnl):,.0f}원 (저성과 감점)")
+        elif historical_pnl < 0:
+            score -= 0.10
+            reasons.append(f"직전 30일 손실 {historical_pnl:,.0f}원")
+        elif historical_pnl >= 50_000:
+            # 우상향 종목은 약한 가산 (양방향 학습)
+            score += 0.05
+            reasons.append(f"직전 30일 누적 +{historical_pnl:,.0f}원 (우상향)")
 
     strength = max(0.0, min(1.0, score))
     action = "BUY" if strength > 0 else "HOLD"

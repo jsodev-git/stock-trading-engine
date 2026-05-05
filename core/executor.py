@@ -30,8 +30,10 @@ _FILL_LOOKUP_DELAYS = (1.5, 2.5, 4.0)
 _RECENT_TRADE_TTL = 600.0  # seconds (10분)
 
 # 잔고-차분 검증 — 주문 직후 KIS 잔고에 반영되기까지 1~3초 지연.
-# retry 1~2회로 eventual consistency 흡수, 여전히 변화 없으면 DISCREPANCY 또는 PENDING 유지.
-_BALANCE_VERIFY_DELAYS = (1.5, 3.0)
+# retry 3회로 eventual consistency 흡수, 여전히 변화 없으면 DISCREPANCY 또는 PENDING 유지.
+# 2026-05-06: 1.5+3.0(총 4.5s) → 2.0+4.0+6.0(총 12s)으로 강화. KIS 모의계좌가 7번 연속 false
+# negative 발생한 사고 후 (4/30 114800 7건 중복매수). 시간 비용 < 데이터 정합성.
+_BALANCE_VERIFY_DELAYS = (2.0, 4.0, 6.0)
 # 자동 복구 임계 — PENDING 상태가 이만큼 경과해도 잔고에 안 반영됐으면 FAILED 마킹.
 # 너무 짧으면 KIS 지연 시 오탐, 너무 길면 다음 사이클 매매와 혼선. 5분이 합리.
 _PENDING_FAIL_THRESHOLD_SEC = 300.0
@@ -403,6 +405,11 @@ def execute_buy_for_bot(
                                            orderUuid=result.order_id)
             except Exception as e:
                 log.warning("[exec][%s] %s DISCREPANCY 마킹 실패: %s", bot_name, code, e)
+            # 2026-05-06: 무한 재시도 차단 — DISCREPANCY 후에도 TTL 마킹 + cash 차감.
+            # 실제 체결 여부 불확실하니 보수적으로 "체결됐다고 가정"하고 다음 사이클 차단.
+            # 4/30 114800 7건 중복 매수 사고 (실제로 다 체결됐는데 검증 실패) 재발 방지.
+            _mark_recent_trade(bot_id, code, "BUY")
+            cash_available -= total_cost
         else:
             # (e3) qty_mismatch 또는 lookup_failed → DISCREPANCY 마킹 + 자동 복구 트리거
             log.warning("[exec][%s] %s 잔고 검증 불일치 (delta=%d expected=%d error=%s)",
@@ -412,6 +419,9 @@ def execute_buy_for_bot(
                                            orderUuid=result.order_id)
             except Exception as e:
                 log.warning("[exec][%s] %s DISCREPANCY 마킹 실패: %s", bot_name, code, e)
+            # 2026-05-06: 무한 재시도 차단 (위와 동일 사유)
+            _mark_recent_trade(bot_id, code, "BUY")
+            cash_available -= total_cost
 
 
 def execute_exits_for_bot(
@@ -631,6 +641,9 @@ def execute_exits_for_bot(
                                            orderUuid=sell_result.order_id)
             except Exception as e:
                 log.warning("[exit][%s] %s DISCREPANCY 마킹 실패: %s", bot_name, code, e)
+            # 2026-05-06: 무한 재시도 차단 — 보수적으로 SELL TTL 마킹.
+            # 실제 체결 여부 불확실 시 다음 사이클에서 또 매도 시도하면 중복 우려.
+            _mark_recent_trade(bot_id, code, "SELL")
         else:
             log.warning("[exit][%s] %s 잔고 검증 불일치 (delta=%d expected=%d error=%s)",
                         bot_name, stock_label, verify.actual_delta, -qty, verify.error)
@@ -639,6 +652,7 @@ def execute_exits_for_bot(
                                            orderUuid=sell_result.order_id)
             except Exception as e:
                 log.warning("[exit][%s] %s DISCREPANCY 마킹 실패: %s", bot_name, code, e)
+            _mark_recent_trade(bot_id, code, "SELL")
 
 
 # ─── helpers ───
@@ -765,9 +779,35 @@ def recover_pending_trades(client: BackendClient, broker: BaseBroker, bot: dict)
                 # 체결 흔적: 보유 줄어들었거나 0. PENDING 시점 보유량을 모르니 "줄어든 게 맞는지"는 모름.
                 # 보수적으로 cur_qty == 0이면 FILLED, 그렇지 않으면 PENDING 유지 (요청 수량만큼 못 줄었을 수도).
                 if cur_qty == 0:
-                    log.info("[recover][%s] SELL %s %s FILLED (잔고 0, 경과 %.0fs)",
-                             bot_name, trade.get("stockName") or "", ticker, elapsed)
-                    client.update_trade_status(cid, "FILLED")
+                    # 2026-05-06: 사고(id=941 profit_amount NULL) 후 — recover SELL → FILLED 전이 시
+                    # actualPrice/Volume/Amount/Fee를 trade의 PENDING 추정값으로라도 보내서
+                    # backend 자동 매칭 로직이 profit을 계산할 수 있게 함.
+                    sell_price = float(trade.get("price") or 0)
+                    sell_qty = req_qty
+                    if sell_price > 0 and sell_qty > 0:
+                        # account_type은 PENDING 시점에 모르므로 기본 KIS 모의=MOCK으로 sell_proceeds 호출
+                        # (REAL이면 backend가 자동 매칭에서 정확한 fee 재계산하면 됨)
+                        try:
+                            from ai.fee import sell_proceeds as _sp
+                            net_receive, sell_fee = _sp(sell_price, sell_qty,
+                                                        bot.get("accountType", "MOCK"), "KOSPI")
+                        except Exception:
+                            net_receive, sell_fee = sell_price * sell_qty, 0.0
+                        log.info("[recover][%s] SELL %s %s FILLED (잔고 0, 경과 %.0fs) "
+                                 "추정 체결액=%.0f fee=%.0f",
+                                 bot_name, trade.get("stockName") or "", ticker, elapsed,
+                                 net_receive, sell_fee)
+                        client.update_trade_status(
+                            cid, "FILLED",
+                            actualPrice=sell_price,
+                            actualVolume=sell_qty,
+                            actualAmount=sell_price * sell_qty,
+                            actualFee=sell_fee,
+                        )
+                    else:
+                        log.info("[recover][%s] SELL %s %s FILLED (잔고 0, 경과 %.0fs)",
+                                 bot_name, trade.get("stockName") or "", ticker, elapsed)
+                        client.update_trade_status(cid, "FILLED")
                 else:
                     # 보유 남아있음 — 부분체결 또는 미체결. DISCREPANCY로 사람 점검 유도.
                     log.warning("[recover][%s] SELL %s %s DISCREPANCY (잔고 %d, 요청 %d, 경과 %.0fs)",

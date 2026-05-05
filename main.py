@@ -53,7 +53,9 @@ def run_signal_cycle(client: BackendClient) -> None:
     if not is_market_open("KR"):
         log.debug("[signal] KR 장 마감 — skip")
         return
-    scan_and_signal_kr(client, top_n=30)
+    # 2026-05-06: top_n 30 → 50. ETF/인버스/레버리지 hard exclude로 후보 풀 축소되는
+    # 부작용 보강 — 일반 종목이 더 많이 노출되도록 거래량 상위 풀 확장.
+    scan_and_signal_kr(client, top_n=50)
 
 
 def main() -> None:

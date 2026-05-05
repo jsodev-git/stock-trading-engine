@@ -22,5 +22,8 @@ requests==2.32.3
 # 환경변수
 python-dotenv==1.0.1
 
+# 한국 공휴일 캘린더 (KRX 휴장일 판정)
+holidays>=0.50
+
 # 테스트
 pytest==8.3.4

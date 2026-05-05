@@ -9,6 +9,8 @@ from __future__ import annotations
 from datetime import datetime, time, timedelta
 from zoneinfo import ZoneInfo
 
+import holidays
+
 KST = ZoneInfo("Asia/Seoul")
 
 KR_OPEN = time(9, 0)
@@ -18,9 +20,26 @@ KR_CLOSE = time(15, 30)
 US_OPEN = time(23, 30)
 US_CLOSE = time(6, 0)
 
+# 한국 공휴일 캘린더 — KRX는 공휴일 휴장. holidays 라이브러리는 매년 자동 갱신.
+# 2026-05-06 추가: 5/1 근로자의날·5/5 어린이날 휴장에도 _is_weekday=True로 통과해
+# signal_cycle 1300건 폭주 사고 발생. 공휴일도 차단해야 함.
+_KR_HOLIDAYS = holidays.KR()
+# KRX 추가 휴장일 (공휴일 외) — 근로자의날(5/1)은 holidays.KR에 포함되지 않을 수 있어 보강
+_KRX_EXTRA_HOLIDAYS = {
+    # (월, 일) 매년 — 근로자의날
+    (5, 1),
+}
+
 
 def _is_weekday(dt: datetime) -> bool:
-    return dt.weekday() < 5  # Mon-Fri
+    """주말·공휴일 모두 제외 — KRX 영업일 판정."""
+    if dt.weekday() >= 5:  # Sat/Sun
+        return False
+    if dt.date() in _KR_HOLIDAYS:
+        return False
+    if (dt.month, dt.day) in _KRX_EXTRA_HOLIDAYS:
+        return False
+    return True
 
 
 def is_market_open(market: str, now: datetime | None = None) -> bool:
