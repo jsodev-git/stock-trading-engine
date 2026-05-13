@@ -196,6 +196,18 @@ def scan_and_signal_kr(client: BackendClient, top_n: int = 30) -> None:
         log.debug("[signal_job] KIS 브로커 없음 — skip")
         return
 
+    # 0. KOSPI 약세장 체크 (2026-05-13) — 시장 자체가 -1% 이하 약세이면 BUY threshold 상향.
+    # 데이터 근거: 5/12 시장 급락 시 6분 만에 -4% 손절 5건 폭주 (-284k). 시장 환경 회피.
+    try:
+        kospi_change = broker.get_kospi_change_rate()
+    except Exception as e:
+        log.debug("[signal_job] KOSPI 등락률 조회 실패: %s", e)
+        kospi_change = None
+    bearish_market = kospi_change is not None and kospi_change <= -0.01
+    if kospi_change is not None:
+        log.info("[signal_job] KOSPI 등락률 %+.2f%% (약세장 %s)",
+                 kospi_change * 100, "ON" if bearish_market else "off")
+
     try:
         # 1. 스크리너
         try:
@@ -309,8 +321,12 @@ def scan_and_signal_kr(client: BackendClient, top_n: int = 30) -> None:
 
         # 3. 봇별 시그널 생성 + 실행
         for bot in kr_bots:
-            threshold = _BUY_THRESHOLD  # 단일값, 성향별 차이 없음
+            # 약세장(-1% 이하)이면 BUY threshold +0.15 상향 — 보수적 진입.
+            threshold = _BUY_THRESHOLD + (0.15 if bearish_market else 0.0)
             bot_id = bot["id"]
+            if bearish_market:
+                log.info("[signal_job][%s] KOSPI 약세장 — threshold %.2f → %.2f",
+                         bot.get("name"), _BUY_THRESHOLD, threshold)
 
             # 당일 손절 종목 재매수 금지 — 2시간 내 매도된 티커 (6h는 너무 보수적)
             try:

@@ -299,6 +299,28 @@ class KISBroker(BaseBroker):
         data = resp.json().get("output") or {}
         return float(data.get("stck_prpr") or 0)
 
+    def get_kospi_change_rate(self) -> float | None:
+        """KOSPI 추종 ETF KODEX 200(069500)의 전일 대비 등락률을 KOSPI 대용으로 반환.
+
+        2026-05-13 도입. KIS inquire-price 응답의 prdy_ctrt 필드(전일 대비 등락률, %).
+        실패 시 None — 호출 측이 None일 때는 약세장 가드 미적용.
+        """
+        try:
+            self._ensure_connected()
+            url = f"{self.base_url}/uapi/domestic-stock/v1/quotations/inquire-price"
+            params = {"FID_COND_MRKT_DIV_CODE": "J", "FID_INPUT_ISCD": "069500"}
+            resp = self._api_call('GET', url, headers=self._auth_headers("FHKST01010100"), params=params)
+            if resp.status_code != 200:
+                return None
+            data = resp.json().get("output") or {}
+            prdy_ctrt = data.get("prdy_ctrt")  # 전일 대비 등락률, % 단위 문자열 (예 "-1.23")
+            if prdy_ctrt is None or prdy_ctrt == "":
+                return None
+            return float(prdy_ctrt) / 100.0  # 소수로 변환 (-1.23% → -0.0123)
+        except Exception as e:
+            log.debug("[KIS] KOSPI 등락률 조회 실패: %s", e)
+            return None
+
     def get_daily_closes(self, stock_code: str, days: int = 30) -> list[float]:
         """최근 days일 종가 리스트 (오래된 → 최신 순). 기술 지표(SMA·RSI) 계산용.
 

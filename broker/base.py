@@ -141,3 +141,11 @@ class BaseBroker(ABC):
         시장가 체결가 vs 요청가 괴리로 인한 집계 오차를 없애기 위해 사용.
         """
         return None
+
+    def get_kospi_change_rate(self) -> float | None:
+        """KOSPI 지수 당일 등락률 (소수, 예 -0.012 = -1.2%). 미구현은 None.
+
+        2026-05-13 도입 — 시장 약세장 (예: 5/12 -1.5%) 회피용. 약세장에는 BUY threshold 상향.
+        구현은 KODEX 200 (069500) 같은 대표 ETF의 전일 대비 등락률로 대용 가능.
+        """
+        return None

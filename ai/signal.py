@@ -137,15 +137,20 @@ def score_buy_candidate(
         score += 0.18
         reasons.append("당일 테마 멤버 (동반 상승)")
 
-    # 9) 학습 루프 (2026-05-06) — 직전 30일 동일 종목 net_pnl 기반 동적 감점.
-    # 데이터 분석: 005880·049080·049480·114800 등 반복 손실 종목에 시그널이 자꾸 BUY 신호 발산.
-    # 같은 종목 누적 손실이면 strength 깎아 같은 패턴 재발 차단.
+    # 9) 학습 루프 (2026-05-06, 2026-05-13 강화) — 직전 30일 동일 종목 net_pnl 기반.
+    # 데이터: 005880·203650·우리기술 등 누적 손실 종목이 학습 루프 -0.10 정도로는 못 막혀서
+    # 5/12 재진입 → 또 손절 패턴. 임계 강화 + 큰 손실 종목은 hard exclude.
     if historical_pnl is not None:
+        if historical_pnl <= -100_000:
+            # hard exclude — 누적 -10만 이하 종목은 신규 진입 금지
+            return Signal(stock_code, stock_name, "HOLD", 0.0,
+                          [f"직전 30일 누적 {historical_pnl:,.0f}원 — 재진입 금지 (hard exclude)"],
+                          price)
         if historical_pnl <= -50_000:
-            score -= 0.20
-            reasons.append(f"직전 30일 누적 -{abs(historical_pnl):,.0f}원 (저성과 감점)")
+            score -= 0.30
+            reasons.append(f"직전 30일 누적 {historical_pnl:,.0f}원 (저성과 강한 감점)")
         elif historical_pnl < 0:
-            score -= 0.10
+            score -= 0.15
             reasons.append(f"직전 30일 손실 {historical_pnl:,.0f}원")
         elif historical_pnl >= 50_000:
             # 우상향 종목은 약한 가산 (양방향 학습)
